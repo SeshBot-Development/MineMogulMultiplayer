@@ -1,0 +1,7 @@
+bin/
+obj/
+build_out/
+*.zip
+*.user
+.vs/
+update_token.txt

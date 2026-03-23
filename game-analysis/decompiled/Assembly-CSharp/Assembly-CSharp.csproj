@@ -1,0 +1,374 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{7891DBB8-645E-43D4-9497-B0619C0736A9}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <AppDesignerFolder>Properties</AppDesignerFolder>
+    <RootNamespace>AzureNature</RootNamespace>
+    <AssemblyName>Assembly-CSharp</AssemblyName>
+    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp-firstpass">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\Assembly-CSharp-firstpass.dll</HintPath>
+    </Reference>
+    <Reference Include="DOTween">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\DOTween.dll</HintPath>
+    </Reference>
+    <Reference Include="DOTweenPro">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\DOTweenPro.dll</HintPath>
+    </Reference>
+    <Reference Include="netstandard">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\netstandard.dll</HintPath>
+    </Reference>
+    <Reference Include="SSCC.Runtime">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\SSCC.Runtime.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.InputSystem">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\Unity.InputSystem.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\Unity.TextMeshPro.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.VisualScripting.Core">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\Unity.VisualScripting.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AnimationModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.AudioModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.ImageConversionModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.JSONSerializeModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.JSONSerializeModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.UI.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.UIModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UnityWebRequestModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.UnityWebRequestModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UnityWebRequestTextureModule">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityEngine.UnityWebRequestTextureModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityUIExtensions">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\MineMogul\MineMogul_Data\Managed\UnityUIExtensions.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <AppDesigner Include="Properties\" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="ActiveQuestEntry.cs" />
+    <Compile Include="AudioClipDescription.cs" />
+    <Compile Include="AutoMiner.cs" />
+    <Compile Include="AutoMinerResourceDefinition.cs" />
+    <Compile Include="AutoMinerSaveData.cs" />
+    <Compile Include="AutoSaveManager.cs" />
+    <Compile Include="AutoSavingWarning.cs" />
+    <Compile Include="BaseBasket.cs" />
+    <Compile Include="BaseHeldTool.cs" />
+    <Compile Include="BaseHeldToolSaveData.cs" />
+    <Compile Include="BaseModularSupports.cs" />
+    <Compile Include="BasePhysicsObject.cs" />
+    <Compile Include="BaseSellableItem.cs" />
+    <Compile Include="BaseSettingOption.cs" />
+    <Compile Include="BlastFurnace.cs" />
+    <Compile Include="BoxContentEntry.cs" />
+    <Compile Include="BoxContents.cs" />
+    <Compile Include="BoxObject.cs" />
+    <Compile Include="BreakableCrate.cs" />
+    <Compile Include="BuildingCrate.cs" />
+    <Compile Include="BuildingCrateSaveData.cs" />
+    <Compile Include="BuildingInventoryDefinition.cs" />
+    <Compile Include="BuildingManager.cs" />
+    <Compile Include="BuildingObject.cs" />
+    <Compile Include="BuildingObjectEntry.cs" />
+    <Compile Include="BuildingPlacementNode.cs" />
+    <Compile Include="BuildingRotationInfo.cs" />
+    <Compile Include="BulkSorter.cs" />
+    <Compile Include="CanPlaceBuilding.cs" />
+    <Compile Include="CastingFurnace.cs" />
+    <Compile Include="CastingFurnaceCoalInput.cs" />
+    <Compile Include="CastingFurnaceInteractionHandler.cs" />
+    <Compile Include="CastingFurnaceMoldArea.cs" />
+    <Compile Include="CastingFurnaceMoldRecipieSet.cs" />
+    <Compile Include="CastingFurnaceRecipie.cs" />
+    <Compile Include="CastingFurnaceSaveData.cs" />
+    <Compile Include="CastingMoldRendererInfo.cs" />
+    <Compile Include="CastingMoldType.cs" />
+    <Compile Include="ChuteHatch.cs" />
+    <Compile Include="ChuteTop.cs" />
+    <Compile Include="ClusterBreaker.cs" />
+    <Compile Include="CoalGaugeNeedle.cs" />
+    <Compile Include="CollisionDisabler.cs" />
+    <Compile Include="ComputerShopUI.cs" />
+    <Compile Include="ComputerTerminal.cs" />
+    <Compile Include="ContractDefinition.cs" />
+    <Compile Include="ContractInfoUI.cs" />
+    <Compile Include="ContractInstance.cs" />
+    <Compile Include="ContractSellTrigger.cs" />
+    <Compile Include="ContractsManager.cs" />
+    <Compile Include="ContractsTerminal.cs" />
+    <Compile Include="ContractsTerminalUI.cs" />
+    <Compile Include="ConveyorBatchRenderingComponent.cs" />
+    <Compile Include="ConveyorBelt.cs" />
+    <Compile Include="ConveyorBeltManager.cs" />
+    <Compile Include="ConveyorBeltShaker.cs" />
+    <Compile Include="ConveyorBeltShakerHorizontal.cs" />
+    <Compile Include="ConveyorBlocker.cs" />
+    <Compile Include="ConveyorBlockerT2.cs" />
+    <Compile Include="ConveyorRenderer.cs" />
+    <Compile Include="ConveyorSoundSource.cs" />
+    <Compile Include="ConveyorSplitterT2.cs" />
+    <Compile Include="CookieFlipbook.cs" />
+    <Compile Include="CrusherMachine.cs" />
+    <Compile Include="DamageableOrePiece.cs" />
+    <Compile Include="DebugManager.cs" />
+    <Compile Include="DebugOreSpawner.cs" />
+    <Compile Include="DecalDestroyer.cs" />
+    <Compile Include="DepositBox.cs" />
+    <Compile Include="DepositBoxCrusher.cs" />
+    <Compile Include="DetonatorBuySign.cs" />
+    <Compile Include="DetonatorExplosion.cs" />
+    <Compile Include="DetonatorExplosionSaveData.cs" />
+    <Compile Include="DetonatorExplosionState.cs" />
+    <Compile Include="DetonatorTrigger.cs" />
+    <Compile Include="DisplacementMeshGenerator.cs" />
+    <Compile Include="DisplayModeSetting.cs" />
+    <Compile Include="EconomyManager.cs" />
+    <Compile Include="EditableSign.cs" />
+    <Compile Include="EditableSignSaveData.cs" />
+    <Compile Include="EditTextPopup.cs" />
+    <Compile Include="ErrorMessagePopup.cs" />
+    <Compile Include="ExtinguishableFire.cs" />
+    <Compile Include="FootstepSoundDefinition.cs" />
+    <Compile Include="FresnelHighlighter.cs" />
+    <Compile Include="GameManager.cs" />
+    <Compile Include="GunAim.cs" />
+    <Compile Include="GunShoot.cs" />
+    <Compile Include="HighlightStyle.cs" />
+    <Compile Include="HolidayType.cs" />
+    <Compile Include="Hopper.cs" />
+    <Compile Include="ICustomSaveDataProvider.cs" />
+    <Compile Include="IDamageable.cs" />
+    <Compile Include="IIconItem.cs" />
+    <Compile Include="IInteractable.cs" />
+    <Compile Include="InfoMessagePopup.cs" />
+    <Compile Include="Interaction.cs" />
+    <Compile Include="InteractionWheelUI.cs" />
+    <Compile Include="InventoryIconBaker.cs" />
+    <Compile Include="InventoryItemPreview.cs" />
+    <Compile Include="InventoryItemPreviewHoverDetector.cs" />
+    <Compile Include="InventorySlotUI.cs" />
+    <Compile Include="InventoryUIManager.cs" />
+    <Compile Include="ISaveLoadableBuildingObject.cs" />
+    <Compile Include="ISaveLoadableObject.cs" />
+    <Compile Include="ISaveLoadableStaticBreakable.cs" />
+    <Compile Include="ISaveLoadableWorldEvent.cs" />
+    <Compile Include="JackOLantern.cs" />
+    <Compile Include="KeybindAction.cs" />
+    <Compile Include="KeybindEntry.cs" />
+    <Compile Include="KeybindManager.cs" />
+    <Compile Include="KeybindTokenText.cs" />
+    <Compile Include="LevelInfo.cs" />
+    <Compile Include="LevelManager.cs" />
+    <Compile Include="LoadingMenu.cs" />
+    <Compile Include="LoopingSoundFader.cs" />
+    <Compile Include="LoopingSoundPlayer.cs" />
+    <Compile Include="MagnetToolSelectionMode.cs" />
+    <Compile Include="MainMenu.cs" />
+    <Compile Include="MainMenuCameraShaker.cs" />
+    <Compile Include="MainMenuElevator.cs" />
+    <Compile Include="MapSelectButton.cs" />
+    <Compile Include="MathExtensions.cs" />
+    <Compile Include="MenuData.cs" />
+    <Compile Include="MenuDataManager.cs" />
+    <Compile Include="ModularBuildingSupports.cs" />
+    <Compile Include="MouseLook.cs" />
+    <Compile Include="MoveController.cs" />
+    <Compile Include="NewGameMenu.cs" />
+    <Compile Include="OldSaveLoadMenu.cs" />
+    <Compile Include="OreAnalyzer.cs" />
+    <Compile Include="OreLimitManager.cs" />
+    <Compile Include="OreLimitState.cs" />
+    <Compile Include="OreManager.cs" />
+    <Compile Include="OreNode.cs" />
+    <Compile Include="OrePiece.cs" />
+    <Compile Include="OrePieceEntry.cs" />
+    <Compile Include="OrePieceKey.cs" />
+    <Compile Include="OrePiecePoolManager.cs" />
+    <Compile Include="OreSled.cs" />
+    <Compile Include="PackagerMachine.cs" />
+    <Compile Include="PackagerMachineInteractor.cs" />
+    <Compile Include="ParticleCollision.cs" />
+    <Compile Include="ParticleExamples.cs" />
+    <Compile Include="ParticleManager.cs" />
+    <Compile Include="ParticleMenu.cs" />
+    <Compile Include="PauseMenu.cs" />
+    <Compile Include="PhysicsGib.cs" />
+    <Compile Include="PhysicsLimitUIWarning.cs" />
+    <Compile Include="PhysicsSoundPlayer.cs" />
+    <Compile Include="PhysicsUtils.cs" />
+    <Compile Include="PieceType.cs" />
+    <Compile Include="PipeRoller.cs" />
+    <Compile Include="PlacementNodeRequirement.cs" />
+    <Compile Include="PlayerController.cs" />
+    <Compile Include="PlayerFootsteps.cs" />
+    <Compile Include="PlayerInputActions.cs" />
+    <Compile Include="PlayerInventory.cs" />
+    <Compile Include="PlayerSpawnPoint.cs" />
+    <Compile Include="PolishingMachine.cs" />
+    <Compile Include="PreviewCameraOrbit.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="Quest.cs" />
+    <Compile Include="QuestDefinition.cs" />
+    <Compile Include="QuestHud.cs" />
+    <Compile Include="QuestID.cs" />
+    <Compile Include="QuestInfoUI.cs" />
+    <Compile Include="QuestManager.cs" />
+    <Compile Include="QuestPreviewRewardEntry.cs" />
+    <Compile Include="QuestRequirement.cs" />
+    <Compile Include="QuestRequirementUI.cs" />
+    <Compile Include="QuestTreeItemButton.cs" />
+    <Compile Include="QuestTreeQuestInfoUI.cs" />
+    <Compile Include="QuestTreeUI.cs" />
+    <Compile Include="RandomizeTweenDelay.cs" />
+    <Compile Include="RapidAutoMiner.cs" />
+    <Compile Include="RapidAutoMinerDrillBit.cs" />
+    <Compile Include="RapidAutoMinerDrillBitToolSaveData.cs" />
+    <Compile Include="Readme.cs" />
+    <Compile Include="ResearchItemButton.cs" />
+    <Compile Include="ResearchItemDefinition.cs" />
+    <Compile Include="ResearchManager.cs" />
+    <Compile Include="ResearchTreeSelectedResearchInfoUI.cs" />
+    <Compile Include="ResearchTreeUI.cs" />
+    <Compile Include="ResolutionSetting.cs" />
+    <Compile Include="ResourceDescription.cs" />
+    <Compile Include="ResourceQuestRequirement.cs" />
+    <Compile Include="ResourceQuestRequirementEntry.cs" />
+    <Compile Include="ResourceType.cs" />
+    <Compile Include="RigidbodyDraggerController.cs" />
+    <Compile Include="RobotGrabberArm.cs" />
+    <Compile Include="RodExtruder.cs" />
+    <Compile Include="RollerSplitter.cs" />
+    <Compile Include="RollingMill.cs" />
+    <Compile Include="RoutingConveyor.cs" />
+    <Compile Include="RoutingConveyorSaveData.cs" />
+    <Compile Include="SavableObjectID.cs" />
+    <Compile Include="SavableWorldEventType.cs" />
+    <Compile Include="SaveEntry.cs" />
+    <Compile Include="SaveFile.cs" />
+    <Compile Include="SaveFileButton.cs" />
+    <Compile Include="SaveFileHeader.cs" />
+    <Compile Include="SaveFileHeaderFileCombo.cs" />
+    <Compile Include="SaveFileScreenshotCamera.cs" />
+    <Compile Include="SavingLoadingManager.cs" />
+    <Compile Include="ScaffoldingSupportLeg.cs" />
+    <Compile Include="SellerMachine.cs" />
+    <Compile Include="SettingKeybind.cs" />
+    <Compile Include="SettingSlider.cs" />
+    <Compile Include="SettingsManager.cs" />
+    <Compile Include="SettingsMenu.cs" />
+    <Compile Include="SettingToggle.cs" />
+    <Compile Include="ShakerTable.cs" />
+    <Compile Include="ShopCartItemButton.cs" />
+    <Compile Include="ShopCategory.cs" />
+    <Compile Include="ShopCategoryButton.cs" />
+    <Compile Include="ShopItem.cs" />
+    <Compile Include="ShopItemButton.cs" />
+    <Compile Include="ShopItemDefinition.cs" />
+    <Compile Include="ShopItemQuestRequirement.cs" />
+    <Compile Include="ShopItemQuestRequirementType.cs" />
+    <Compile Include="ShopItemResearchItemDefinition.cs" />
+    <Compile Include="ShopObjectPurchaseEntry.cs" />
+    <Compile Include="ShopPurchases.cs" />
+    <Compile Include="ShopSpawnPoint.cs" />
+    <Compile Include="Singleton.cs" />
+    <Compile Include="SorterFilterBasket.cs" />
+    <Compile Include="SorterMachine.cs" />
+    <Compile Include="SoundDefinition.cs" />
+    <Compile Include="SoundManager.cs" />
+    <Compile Include="SoundPlayer.cs" />
+    <Compile Include="StartingElevator.cs" />
+    <Compile Include="SteamNewsFetcher.cs" />
+    <Compile Include="SteamNewsItemUI.cs" />
+    <Compile Include="SupportType.cs" />
+    <Compile Include="TemporaryContinuousCollisionSetter.cs" />
+    <Compile Include="ThreadingLathe.cs" />
+    <Compile Include="TimedQuestRequirement.cs" />
+    <Compile Include="TimeSince.cs" />
+    <Compile Include="TimeUntil.cs" />
+    <Compile Include="TimeUtil.cs" />
+    <Compile Include="TMPBounceEffect.cs" />
+    <Compile Include="ToolBuilder.cs" />
+    <Compile Include="ToolBuilderSaveData.cs" />
+    <Compile Include="ToolCastingMold.cs" />
+    <Compile Include="ToolDebugSpawnTool.cs" />
+    <Compile Include="ToolHammer.cs" />
+    <Compile Include="ToolHardHat.cs" />
+    <Compile Include="ToolMagnet.cs" />
+    <Compile Include="ToolMagnetSaveData.cs" />
+    <Compile Include="ToolMiningHat.cs" />
+    <Compile Include="ToolPickaxe.cs" />
+    <Compile Include="ToolResourceScanner.cs" />
+    <Compile Include="ToolSupportsWrench.cs" />
+    <Compile Include="TriggeredQuestRequirement.cs" />
+    <Compile Include="TriggeredQuestRequirementType.cs" />
+    <Compile Include="UIButtonSounds.cs" />
+    <Compile Include="UIManager.cs" />
+    <Compile Include="UniqueQueue.cs" />
+    <Compile Include="UnitySourceGeneratedAssemblyMonoScriptTypes_v1.cs" />
+    <Compile Include="UnlockResearchQuestRequirement.cs" />
+    <Compile Include="UpdatedLevelNewObjectAdder.cs" />
+    <Compile Include="UpgradeDepositBoxResearchItemDefinition.cs" />
+    <Compile Include="Vector3Utils.cs" />
+    <Compile Include="VersionManager.cs" />
+    <Compile Include="VertexPainter.cs" />
+    <Compile Include="WaterVolume.cs" />
+    <Compile Include="WeightedNodeDrop.cs" />
+    <Compile Include="WeightedOreChance.cs" />
+    <Compile Include="WorldEventEntry.cs" />
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

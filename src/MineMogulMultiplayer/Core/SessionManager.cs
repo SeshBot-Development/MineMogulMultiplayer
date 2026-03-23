@@ -1,0 +1,3979 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.InteropServices;
+using BepInEx.Logging;
+using MineMogulMultiplayer.Models;
+using MineMogulMultiplayer.Networking;
+using MineMogulMultiplayer.Patches;
+using MineMogulMultiplayer.Serialization;
+using MineMogulMultiplayer.UI;
+using Steamworks;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace MineMogulMultiplayer.Core
+{
+    /// <summary>
+    /// Central session manager. Orchestrates the host/client lifecycle,
+    /// wires up Steam P2P networking events, and drives the tick loop.
+    /// </summary>
+    public class SessionManager : IDisposable
+    {
+        private readonly ManualLogSource _log;
+        private SteamP2P _net;
+
+        // Authoritative player list (host only)
+        private readonly List<PlayerState> _players = new List<PlayerState>();
+        private long _tick;
+
+        // Cached PlayerController to avoid expensive FindFirstObjectByType every tick
+        private PlayerController _cachedPlayerController;
+
+        private const int HashCheckInterval = 600;
+        private const int ConsecutiveDesyncThreshold = 3;
+        private int _consecutiveDesyncCount;
+
+        public bool SteamReady { get; private set; }
+
+        /// <summary>Global instance so patches can dispatch RPCs without holding a reference.</summary>
+        public static SessionManager Instance { get; private set; }
+
+        /// <summary>True while the host scene is still loading (P2P not yet started).</summary>
+        public bool IsPendingHost => _pendingHost;
+
+        // Pending host: we opened the relay socket but are waiting for a scene to load
+        private bool _pendingHost;
+        private string _pendingPlayerName;
+
+        // Client: waiting for gameplay scene to load before processing snapshots
+        private bool _clientLoadingScene;
+
+        // Client: scene is loaded, waiting for host to signal "ingame" before connecting P2P
+        private bool _clientSceneReady;
+
+        // Client connection timeout
+        private float _clientConnectTime;
+        private bool _clientWaitingForConnect;
+        private const float ConnectTimeoutSeconds = 15f;
+
+        // Track connected player names for event log
+        private readonly Dictionary<uint, string> _clientNames = new Dictionary<uint, string>();
+
+        // ── Ore network ID tracking (host only) ──
+        private int _nextOreNetId = 1;
+        private readonly Dictionary<int, int> _hostOreInstanceToNetId = new Dictionary<int, int>(); // hostInstanceId → netId
+
+        // ── Client ore tracking ──
+        private readonly Dictionary<int, OrePiece> _clientOreByNetId = new Dictionary<int, OrePiece>();
+
+        // Client: true until the first FullSnapshot is received (ignore deltas/ores until then)
+        private bool _clientWaitingForSnapshot;
+
+        // Client: handshake/sync retry mechanism
+        private bool _handshakeAckReceived;
+        private float _lastSyncRequestTime;
+        private int _syncRetryCount;
+        private const float SyncRetryInterval = 3f;
+        private const int MaxSyncRetries = 10;
+
+        // Host: clients accepted but who haven't received FullSnapshot yet (edge case: scene briefly not ready)
+        private readonly HashSet<uint> _pendingSnapshotClients = new HashSet<uint>();
+
+        // ── Pooled per-tick collections (avoid GC pressure) ──
+        private readonly List<OrePieceState> _poolSpawnedOres = new List<OrePieceState>();
+        private readonly List<int> _poolRemovedOreIds = new List<int>();
+        private readonly List<BuildingRemovalInfo> _poolRemovedBuildings = new List<BuildingRemovalInfo>();
+        private readonly HashSet<int> _poolDirtyMachines = new HashSet<int>();
+        private readonly HashSet<int> _poolDirtyBelts = new HashSet<int>();
+        private readonly HashSet<int> _oreCurrentIds = new HashSet<int>(); // reused in DetectOreChanges
+
+        // ── Ore position sync (host tracks last-sent positions, sends updates for moved ores) ──
+        private readonly Dictionary<int, Vector3> _lastSentOrePositions = new Dictionary<int, Vector3>(); // netId → pos
+        private const float OrePositionMoveThreshold = 0.05f; // send if moved more than 5cm
+        private const int OrePositionSyncInterval = 2; // every 2 ticks (~10 times/sec at 20 tps)
+        private readonly List<OrePositionUpdate> _poolOrePositionUpdates = new List<OrePositionUpdate>();
+
+        // ── BreakableCrate network ID tracking (host only) ──
+        private int _nextCrateNetId = 1;
+        private readonly Dictionary<int, int> _hostCrateInstanceToNetId = new Dictionary<int, int>(); // hostInstanceId → netId
+        // ── Client crate tracking ──
+        private readonly Dictionary<int, BreakableCrate> _clientCrateByNetId = new Dictionary<int, BreakableCrate>();
+        // ── Crate position sync ──
+        private readonly Dictionary<int, Vector3> _lastSentCratePositions = new Dictionary<int, Vector3>();
+        private readonly List<CratePositionUpdate> _poolCratePositionUpdates = new List<CratePositionUpdate>();
+        // Cached crate lookup for ApplyClientCratePositions (cleared each tick)
+        private Dictionary<int, BreakableCrate> _cachedCrateLookup;
+        // Cached building lookup for BuildDirtyBuildings (cleared each tick)
+        private Dictionary<int, BuildingObject> _cachedBuildingLookup;
+
+        // ── Batched building reconciliation (avoid spawning 1000+ buildings in one frame) ──
+        private Queue<BuildingState> _pendingBuildingSpawns;
+        private const int MaxBuildingSpawnsPerTick = 30;
+
+        // ── Remotely-held ore kinematic management ──
+        private readonly Dictionary<int, float> _remotelyHeldOres = new Dictionary<int, float>(); // netId → lastUpdateTime
+        private const float RemoteHoldTimeout = 1.5f; // seconds before ore returns to physics
+
+        // ── Debug bot (local testing without a second player) ──
+        private bool _debugBotActive;
+        private float _debugBotAngle;
+        private const int DebugBotPlayerId = 999;
+        private static readonly string[] DebugBotTools = new[]
+        {
+            "PickaxeBasic", "HammerBasic", "JackHammer", "ToolBuilder", "HardHat",
+            "MiningHelmet", "MagnetTool", "WrenchTool", "IngotMold", null // null = empty-handed
+        };
+
+        // ── Steam Lobby (for invites & friend joining) ──
+        private Steamworks.Data.Lobby? _lobby;
+        public const int MaxPlayers = 4;
+
+        // ── Lobby-first flow ──
+        // Phase 1: Lobby only (main menu). No P2P yet.
+        // Phase 2: Host launches game → P2P starts, clients connect.
+        public enum LobbyPhase { None, InLobby, Launching, InGame }
+        public LobbyPhase Phase { get; private set; } = LobbyPhase.None;
+
+        /// <summary>Names of players currently in the Steam lobby (updated from lobby member list).</summary>
+        public List<string> LobbyPlayerNames { get; private set; } = new List<string>();
+
+        /// <summary>Fires when the lobby player list changes.</summary>
+        public event Action OnLobbyPlayersChanged;
+
+        /// <summary>Fires when the lobby host launches the game (client side).</summary>
+        public event Action OnLobbyLaunched;
+
+        // Client: host Steam ID to connect P2P to after scene loads
+        private ulong _lobbyHostId;
+        // Client: save info received from lobby data for scene loading
+        private string _launchSceneName;
+
+        /// <summary>True when in lobby or in game.</summary>
+        public bool IsInLobby => Phase != LobbyPhase.None;
+
+
+        public SessionManager(ManualLogSource log)
+        {
+            _log = log;
+            Instance = this;
+            PreloadSteamNative();
+            InitSteam();
+            SceneManager.sceneLoaded += OnSceneLoaded;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LoadLibrary(string lpFileName);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetDllDirectory(string lpPathName);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetModuleFileName(IntPtr hModule, System.Text.StringBuilder lpFilename, uint nSize);
+
+        /// <summary>
+        /// Ensure steam_api64.dll is available for P/Invoke by Facepunch.Steamworks.
+        /// Mono's DllImport resolver ONLY checks: app base dir, assembly dir, and PATH.
+        /// It ignores LoadLibrary/SetDllDirectory. So we must ensure a physical copy of
+        /// the DLL exists in one of those locations. As a last resort, we extract a copy
+        /// from the embedded resource baked into this assembly.
+        /// </summary>
+        private void PreloadSteamNative()
+        {
+            const string DllName = "steam_api64.dll";
+            try
+            {
+                var gameDir = System.IO.Path.GetDirectoryName(UnityEngine.Application.dataPath);
+                var modDir = System.IO.Path.GetDirectoryName(
+                    System.Reflection.Assembly.GetExecutingAssembly().Location);
+                _log.LogInfo($"[Steam] Game dir: '{gameDir}'  Mod dir: '{modDir}'");
+
+                // ── 0. Add mod dir + game dir to PATH so Mono can resolve from both ──
+                try
+                {
+                    var path = System.Environment.GetEnvironmentVariable("PATH") ?? "";
+                    bool changed = false;
+                    if (!string.IsNullOrEmpty(modDir) && !path.Contains(modDir))
+                    { path = modDir + ";" + path; changed = true; }
+                    if (!string.IsNullOrEmpty(gameDir) && !path.Contains(gameDir))
+                    { path = gameDir + ";" + path; changed = true; }
+                    if (changed)
+                    {
+                        System.Environment.SetEnvironmentVariable("PATH", path);
+                        _log.LogInfo("[Steam] Updated PATH for Mono P/Invoke resolution");
+                    }
+                }
+                catch (Exception ex) { _log.LogWarning($"[Steam] PATH update failed: {ex.Message}"); }
+
+                // ── 1. Already loaded by the game process? ──
+                var hModule = GetModuleHandle("steam_api64");
+                if (hModule != IntPtr.Zero)
+                {
+                    _log.LogInfo("[Steam] steam_api64.dll already loaded in process");
+                    EnsureDllInGameRoot(hModule, gameDir, modDir);
+                    return;
+                }
+
+                SetDllDirectory(gameDir);
+
+                // ── 2. Quick check: game root ──
+                var gameRootDll = System.IO.Path.Combine(gameDir, DllName);
+                if (TryLoadNative(gameRootDll)) return;
+
+                // ── 3. Quick check: mod directory (bundled with zip) ──
+                if (!string.IsNullOrEmpty(modDir))
+                {
+                    var modDll = System.IO.Path.Combine(modDir, DllName);
+                    if (TryLoadNative(modDll))
+                    {
+                        CopyDllTo(modDll, gameRootDll);
+                        return;
+                    }
+                }
+
+                // ── 4. Extract from embedded resource (guaranteed present in our assembly) ──
+                if (ExtractEmbeddedSteamDll(gameRootDll))
+                {
+                    if (TryLoadNative(gameRootDll)) return;
+                }
+
+                // ── 5. Search loaded process modules ──
+                try
+                {
+                    foreach (System.Diagnostics.ProcessModule mod in
+                             System.Diagnostics.Process.GetCurrentProcess().Modules)
+                    {
+                        try
+                        {
+                            if (mod.ModuleName != null &&
+                                mod.ModuleName.Equals(DllName, System.StringComparison.OrdinalIgnoreCase))
+                            {
+                                _log.LogInfo($"[Steam] Found via process modules: '{mod.FileName}'");
+                                if (TryLoadNative(mod.FileName))
+                                {
+                                    CopyDllTo(mod.FileName, gameRootDll);
+                                    return;
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch (Exception ex) { _log.LogWarning($"[Steam] Process module scan: {ex.Message}"); }
+
+                // ── 6. Search ALL games in every Steam library folder ──
+                if (TryFindFromAnySteamGame(gameRootDll)) return;
+
+                // ── 7. Recursive search under game directory ──
+                try
+                {
+                    foreach (var found in System.IO.Directory.GetFiles(
+                                 gameDir, DllName, System.IO.SearchOption.AllDirectories))
+                    {
+                        if (TryLoadNative(found)) { CopyDllTo(found, gameRootDll); return; }
+                    }
+                }
+                catch (Exception ex) { _log.LogWarning($"[Steam] Recursive game dir search: {ex.Message}"); }
+
+                _log.LogError("[Steam] Could not obtain steam_api64.dll from any source — multiplayer will NOT work");
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Steam] PreloadSteamNative error: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Extract the embedded steam_api64.dll resource from our assembly to disk.
+        /// Tries the target path first (game root), then falls back to mod dir.
+        /// Both locations are on PATH, so Mono P/Invoke will find it either way.
+        /// </summary>
+        private bool ExtractEmbeddedSteamDll(string targetPath)
+        {
+            // If it already exists at the target, we're good
+            if (System.IO.File.Exists(targetPath))
+            {
+                _log.LogInfo($"[Steam] DLL already exists: '{targetPath}'");
+                return true;
+            }
+
+            // Also check mod dir — might already be there from zip extraction
+            var modDir = System.IO.Path.GetDirectoryName(
+                System.Reflection.Assembly.GetExecutingAssembly().Location);
+            if (!string.IsNullOrEmpty(modDir))
+            {
+                var modDll = System.IO.Path.Combine(modDir, "steam_api64.dll");
+                if (System.IO.File.Exists(modDll))
+                {
+                    _log.LogInfo($"[Steam] DLL already in mod dir: '{modDll}'");
+                    return true;
+                }
+            }
+
+            // Read the embedded resource once
+            byte[] dllBytes;
+            try
+            {
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                using (var stream = asm.GetManifestResourceStream("steam_api64.dll"))
+                {
+                    if (stream == null)
+                    {
+                        _log.LogWarning("[Steam] Embedded steam_api64.dll resource not found in assembly");
+                        return false;
+                    }
+                    dllBytes = new byte[stream.Length];
+                    stream.Read(dllBytes, 0, dllBytes.Length);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Steam] Failed to read embedded resource: {ex.Message}");
+                return false;
+            }
+
+            _log.LogInfo($"[Steam] Embedded DLL read: {dllBytes.Length} bytes. Attempting extraction...");
+
+            // Try writing to game root (e.g. C:\Program Files\...\MineMogul\)
+            if (TryWriteBytes(targetPath, dllBytes))
+                return true;
+
+            // Fallback: write to mod dir (BepInEx\plugins\MineMogulMultiplayer\)
+            // This is on PATH so Mono will find it
+            if (!string.IsNullOrEmpty(modDir))
+            {
+                var altPath = System.IO.Path.Combine(modDir, "steam_api64.dll");
+                if (TryWriteBytes(altPath, dllBytes))
+                    return true;
+            }
+
+            _log.LogError("[Steam] Could not write steam_api64.dll to any location — check file permissions");
+            return false;
+        }
+
+        /// <summary>Write bytes to a file, returning true on success. Never throws.</summary>
+        private bool TryWriteBytes(string path, byte[] data)
+        {
+            try
+            {
+                var dir = System.IO.Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+                    System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.WriteAllBytes(path, data);
+                _log.LogInfo($"[Steam] Extracted DLL → '{path}'");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning($"[Steam] Cannot write to '{path}': {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// When the DLL is already loaded, ensure a physical copy exists in game root
+        /// so Mono P/Invoke can find it for Facepunch.Steamworks.
+        /// </summary>
+        private void EnsureDllInGameRoot(IntPtr hModule, string gameDir, string modDir)
+        {
+            var targetPath = System.IO.Path.Combine(gameDir, "steam_api64.dll");
+            if (System.IO.File.Exists(targetPath)) return;
+
+            // Try to get the loaded path
+            var sb = new System.Text.StringBuilder(512);
+            if (GetModuleFileName(hModule, sb, (uint)sb.Capacity) > 0)
+            {
+                var sourcePath = sb.ToString();
+                _log.LogInfo($"[Steam] Loaded from: '{sourcePath}'");
+                CopyDllTo(sourcePath, targetPath);
+                return;
+            }
+
+            // Fallback: extract from embedded resource
+            ExtractEmbeddedSteamDll(targetPath);
+        }
+
+        /// <summary>Copy DLL file, logging success/failure. Silent if source == target.</summary>
+        private void CopyDllTo(string sourcePath, string targetPath)
+        {
+            try
+            {
+                if (System.IO.File.Exists(targetPath)) return;
+                var srcFull = System.IO.Path.GetFullPath(sourcePath);
+                var tgtFull = System.IO.Path.GetFullPath(targetPath);
+                if (string.Equals(srcFull, tgtFull, System.StringComparison.OrdinalIgnoreCase)) return;
+                System.IO.File.Copy(sourcePath, targetPath, false);
+                _log.LogInfo($"[Steam] Copied DLL → '{targetPath}'");
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning($"[Steam] Copy failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Parse Steam's libraryfolders.vdf and search ALL installed games in every library
+        /// for a steam_api64.dll we can borrow. Any Steam game ships one.
+        /// </summary>
+        private bool TryFindFromAnySteamGame(string gameRootDll)
+        {
+            try
+            {
+                var steamPath = Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath", null) as string;
+                if (string.IsNullOrEmpty(steamPath)) return false;
+
+                var vdfPath = System.IO.Path.Combine(steamPath, "steamapps", "libraryfolders.vdf");
+                if (!System.IO.File.Exists(vdfPath)) return false;
+
+                var libPaths = new System.Collections.Generic.List<string>();
+                foreach (var line in System.IO.File.ReadAllLines(vdfPath))
+                {
+                    var trimmed = line.Trim();
+                    if (!trimmed.StartsWith("\"path\"")) continue;
+                    var parts = trimmed.Split('"');
+                    if (parts.Length < 4) continue;
+                    libPaths.Add(parts[3].Replace("\\\\", "\\"));
+                }
+
+                foreach (var libPath in libPaths)
+                {
+                    var commonDir = System.IO.Path.Combine(libPath, "steamapps", "common");
+                    if (!System.IO.Directory.Exists(commonDir)) continue;
+
+                    try
+                    {
+                        foreach (var gameFolder in System.IO.Directory.GetDirectories(commonDir))
+                        {
+                            var candidate = System.IO.Path.Combine(gameFolder, "steam_api64.dll");
+                            if (!System.IO.File.Exists(candidate)) continue;
+                            _log.LogInfo($"[Steam] Found DLL in sibling game: '{candidate}'");
+                            if (TryLoadNative(candidate))
+                            {
+                                CopyDllTo(candidate, gameRootDll);
+                                return true;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning($"[Steam] Steam library scan: {ex.Message}");
+            }
+            return false;
+        }
+
+        private bool TryLoadNative(string path)
+        {
+            if (!System.IO.File.Exists(path)) return false;
+            var handle = LoadLibrary(path);
+            if (handle != IntPtr.Zero)
+            {
+                _log.LogInfo($"[Steam] Loaded steam_api64.dll from '{path}'");
+                return true;
+            }
+            _log.LogWarning($"[Steam] LoadLibrary failed for '{path}' (error {Marshal.GetLastWin32Error()})");
+            return false;
+        }
+
+        private void InitSteam()
+        {
+            try
+            {
+                // The game already initializes Steamworks — try to use the existing session first
+                if (SteamClient.IsValid)
+                {
+                    SteamReady = true;
+                    _log.LogInfo($"[Steam] Already initialized by game. User: {SteamClient.Name} ({SteamClient.SteamId})");
+                }
+                else
+                {
+                    // Try standard init; if that fails, try with asyncCallbacks
+                    try
+                    {
+                        SteamClient.Init(3846120, false);
+                    }
+                    catch
+                    {
+                        SteamClient.Init(3846120, true);
+                    }
+                    SteamReady = true;
+                    _log.LogInfo($"[Steam] Initialized. User: {SteamClient.Name} ({SteamClient.SteamId})");
+                }
+
+                // Listen for lobby join requests from Steam overlay / friend invites
+                SteamMatchmaking.OnLobbyInvite += OnLobbyInvite;
+                SteamMatchmaking.OnLobbyMemberJoined += OnLobbyMemberJoined;
+                SteamMatchmaking.OnLobbyMemberLeave += OnLobbyMemberLeave;
+                SteamMatchmaking.OnLobbyDataChanged += OnLobbyDataChanged;
+                SteamFriends.OnGameLobbyJoinRequested += OnGameLobbyJoinRequested;
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Steam] Failed to init: {ex.Message}");
+                SteamReady = false;
+            }
+
+            // Warm up Steam Relay network access early (separate try/catch so Steam stays usable)
+            try
+            {
+                SteamNetworkingUtils.InitRelayNetworkAccess();
+                _log.LogInfo("[Steam] Relay network access initialized");
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning($"[Steam] InitRelayNetworkAccess failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>Retry Steam init — called from Plugin.Update if Steam wasn't ready at startup.</summary>
+        public void RetryInitSteam()
+        {
+            if (SteamReady) return;
+            // Re-run native DLL search — the game may have loaded it since our last attempt
+            PreloadSteamNative();
+            InitSteam();
+        }
+
+        // ══════════════════════════════════════════════
+        //  LOBBY-FIRST FLOW
+        // ══════════════════════════════════════════════
+
+        /// <summary>Host creates a Steam lobby from the main menu. No P2P yet.</summary>
+        public async void CreateLobby(string playerName)
+        {
+            if (!SteamReady) { _log.LogError("[Session] Steam not ready"); LogEvent("Steam not connected!"); return; }
+            if (Phase != LobbyPhase.None) { _log.LogWarning("[Session] Already in a lobby"); return; }
+
+            _pendingPlayerName = playerName;
+            try
+            {
+                var result = await SteamMatchmaking.CreateLobbyAsync(MaxPlayers);
+                if (!result.HasValue) { _log.LogError("[Session] Failed to create lobby"); return; }
+
+                _lobby = result.Value;
+                _lobby.Value.SetFriendsOnly();
+                _lobby.Value.SetData("mod", PluginInfo.GUID);
+                _lobby.Value.SetData("version", PluginInfo.Version);
+                _lobby.Value.SetData("host_steamid", SteamClient.SteamId.ToString());
+                _lobby.Value.SetData("state", "waiting");
+                Phase = LobbyPhase.InLobby;
+                _log.LogInfo($"[Session] Lobby created: {_lobby.Value.Id}");
+                RefreshLobbyPlayers();
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Session] Lobby creation error: {ex.Message}");
+            }
+        }
+
+        /// <summary>Client joins an existing lobby by host Steam ID or lobby.</summary>
+        public async void JoinLobbyByHostId(ulong hostSteamId, string playerName)
+        {
+            if (!SteamReady) { _log.LogError("[Session] Steam not ready"); return; }
+            if (Phase != LobbyPhase.None) { _log.LogWarning("[Session] Already in a lobby"); return; }
+
+            _pendingPlayerName = playerName;
+            _lobbyHostId = hostSteamId;
+
+            // We need to find the lobby. Use Steam friend lobby joining.
+            // Set up for when the lobby invite arrives or user joins directly
+            _log.LogInfo($"[Session] Looking for lobby hosted by {hostSteamId}...");
+
+            // Try to get the lobby via friend game info
+            try
+            {
+                // Search for lobbies with matching host
+                var list = await SteamMatchmaking.LobbyList
+                    .FilterDistanceWorldwide()
+                    .WithKeyValue("mod", PluginInfo.GUID)
+                    .WithKeyValue("host_steamid", hostSteamId.ToString())
+                    .RequestAsync();
+
+                if (list != null && list.Length > 0)
+                {
+                    var lobby = list[0];
+                    var joinResult = await lobby.Join();
+                    if (joinResult == RoomEnter.Success)
+                    {
+                        _lobby = lobby;
+                        Phase = LobbyPhase.InLobby;
+                        _log.LogInfo($"[Session] Joined lobby {lobby.Id}");
+                        RefreshLobbyPlayers();
+
+                        // Check if host already launched
+                        var state = lobby.GetData("state");
+                        if (state == "launching" || state == "ingame")
+                        {
+                            HandleLobbyLaunch();
+                        }
+                    }
+                    else
+                    {
+                        _log.LogError($"[Session] Failed to join lobby: {joinResult}");
+                    }
+                }
+                else
+                {
+                    _log.LogWarning("[Session] No lobby found — try using Steam invite instead");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Session] JoinLobbyByHostId error: {ex.Message}");
+            }
+        }
+
+        /// <summary>Join a specific lobby (used by Steam invite callback).</summary>
+        public async void JoinLobbyDirect(Steamworks.Data.Lobby lobby, string playerName)
+        {
+            if (Phase != LobbyPhase.None) { _log.LogWarning("[Session] Already in a lobby"); return; }
+
+            _pendingPlayerName = playerName;
+            try
+            {
+                var joinResult = await lobby.Join();
+                if (joinResult == RoomEnter.Success)
+                {
+                    _lobby = lobby;
+                    _lobbyHostId = 0;
+                    var hostStr = lobby.GetData("host_steamid");
+                    if (ulong.TryParse(hostStr, out ulong hid))
+                        _lobbyHostId = hid;
+                    Phase = LobbyPhase.InLobby;
+                    _log.LogInfo($"[Session] Joined lobby {lobby.Id} (host: {_lobbyHostId})");
+                    RefreshLobbyPlayers();
+
+                    // Check if host already launched
+                    var state = lobby.GetData("state");
+                    if (state == "launching" || state == "ingame")
+                    {
+                        HandleLobbyLaunch();
+                    }
+                }
+                else
+                {
+                    _log.LogError($"[Session] Failed to join lobby: {joinResult}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Session] JoinLobbyDirect error: {ex.Message}");
+            }
+        }
+
+        /// <summary>Host launches the game: starts P2P, sets lobby data, loads save.</summary>
+        public void LaunchGame(string fullFilePath, string sceneName, string playerName)
+        {
+            if (!SteamReady || !_lobby.HasValue) { _log.LogError("[Session] Cannot launch — no lobby"); return; }
+
+            _pendingPlayerName = playerName;
+            Phase = LobbyPhase.Launching;
+
+            // Set lobby data so clients know to connect
+            _lobby.Value.SetData("state", "launching");
+            _lobby.Value.SetData("scene_name", sceneName);
+
+            // P2P host will start AFTER scene loads (in OnSceneLoaded) to avoid
+            // race conditions where clients connect before the host is ready.
+            _pendingHost = true;
+
+            // Load the save
+            var slm = Singleton<SavingLoadingManager>.Instance;
+            if (slm != null)
+            {
+                slm.LoadSceneThenLoadSave(fullFilePath, sceneName);
+                _log.LogInfo($"[Session] Host launching: loading '{fullFilePath}' scene '{sceneName}'");
+            }
+            else
+            {
+                _log.LogError("[Session] SavingLoadingManager not available");
+                Phase = LobbyPhase.InLobby;
+                _pendingHost = false;
+                _net.Stop(); _net = null;
+            }
+        }
+
+        /// <summary>Called on client when lobby data says "launching".</summary>
+        private void HandleLobbyLaunch()
+        {
+            if (Phase == LobbyPhase.InGame || Phase == LobbyPhase.Launching) return;
+            if (!_lobby.HasValue) return;
+
+            var sceneName = _lobby.Value.GetData("scene_name");
+            var hostStr = _lobby.Value.GetData("host_steamid");
+            if (string.IsNullOrEmpty(sceneName) || string.IsNullOrEmpty(hostStr)) return;
+            if (!ulong.TryParse(hostStr, out ulong hostId)) return;
+
+            _lobbyHostId = hostId;
+            _launchSceneName = sceneName;
+            Phase = LobbyPhase.Launching;
+            _log.LogInfo($"[Session] Host launched game — loading scene '{sceneName}', will connect P2P to {hostId}");
+            LogEvent("Host launched the game — loading...");
+            OnLobbyLaunched?.Invoke();
+
+            // Load the gameplay scene
+            SceneManager.LoadScene(sceneName);
+        }
+
+        /// <summary>Update the lobby player name list from Steam lobby members.</summary>
+        public void RefreshLobbyPlayers()
+        {
+            LobbyPlayerNames.Clear();
+            if (!_lobby.HasValue) return;
+            foreach (var member in _lobby.Value.Members)
+            {
+                LobbyPlayerNames.Add(member.Name ?? member.Id.ToString());
+            }
+            _log.LogInfo($"[Session] Lobby players: {string.Join(", ", LobbyPlayerNames)}");
+            OnLobbyPlayersChanged?.Invoke();
+        }
+
+        /// <summary>Leave the current lobby and reset state.</summary>
+        public void LeaveLobbyAndReset()
+        {
+            LeaveLobby();
+            if (_net != null) { _net.Stop(); _net = null; }
+            Phase = LobbyPhase.None;
+            _pendingHost = false;
+            _clientLoadingScene = false;
+            _clientSceneReady = false;
+            _clientWaitingForConnect = false;
+            _clientWaitingForSnapshot = false;
+            _handshakeAckReceived = false;
+            _syncRetryCount = 0;
+            _consecutiveDesyncCount = 0;
+            MultiplayerState.CurrentRole = MultiplayerState.Role.Offline;
+            _players.Clear();
+            _clientNames.Clear();
+            LobbyPlayerNames.Clear();
+            RemotePlayerManager.Clear();
+            _log.LogInfo("[Session] Left lobby and reset");
+            OnLobbyPlayersChanged?.Invoke();
+        }
+
+
+        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            // Invalidate cached PlayerController — it will be re-found next tick
+            _cachedPlayerController = null;
+
+            // Destroy stale remote player visuals from previous scene
+            RemotePlayerManager.Clear();
+
+            if (_pendingHost)
+            {
+                // Scene finished loading — start P2P and finalize host startup
+                if (_net != null) { _net.Stop(); _net = null; }
+                _net = new SteamP2P();
+                _net.StartHost(_log);
+                _net.OnClientConnected += HandleClientConnected;
+                _net.OnClientDisconnected += HandleClientDisconnected;
+                _net.OnMessageReceived += HandleHostMessage;
+
+                _pendingHost = false;
+                MultiplayerState.CurrentRole = MultiplayerState.Role.Host;
+                MultiplayerState.LocalPlayerId = 0;
+                Phase = LobbyPhase.InGame;
+
+                // Mark lobby as in-game so clients know the host is ready for P2P
+                if (_lobby.HasValue)
+                    _lobby.Value.SetData("state", "ingame");
+
+                var eco = Singleton<EconomyManager>.Instance;
+                _players.Clear();
+                _players.Add(new PlayerState
+                {
+                    PlayerId = 0,
+                    DisplayName = _pendingPlayerName,
+                    Money = eco != null ? eco.Money : 0
+                });
+
+                _log.LogInfo($"[Session] Scene '{scene.name}' loaded. Host is now active.");
+                LogEvent($"Server started. Waiting for players...");
+                InitializeKnownOres();
+                return;
+            }
+
+            // Client: scene loaded after lobby launch → wait for host to be ready
+            if (Phase == LobbyPhase.Launching && _lobbyHostId != 0)
+            {
+                _clientSceneReady = true;
+                _log.LogInfo($"[Session] Client scene '{scene.name}' loaded, waiting for host to be ready...");
+                LogEvent("Scene loaded. Waiting for host...");
+
+                // If the host is already in-game, connect immediately
+                if (_lobby.HasValue && _lobby.Value.GetData("state") == "ingame")
+                {
+                    ConnectP2PToHost(_pendingPlayerName ?? SteamClient.Name ?? "Player");
+                }
+                return;
+            }
+
+            if (_clientLoadingScene && MultiplayerState.IsClient)
+            {
+                _clientLoadingScene = false;
+                _log.LogInfo($"[Session] Client scene '{scene.name}' loaded. Requesting sync...");
+                LogEvent("Scene loaded. Syncing with host...");
+                _net?.SendToHost(MessageType.ResyncRequest, _tick);
+            }
+        }
+
+        /// <summary>Client establishes P2P connection to host after scene is loaded.</summary>
+        private void ConnectP2PToHost(string playerName)
+        {
+            _clientSceneReady = false;
+            if (_net != null) { _net.Stop(); _net = null; }
+
+            try { SteamNetworkingUtils.InitRelayNetworkAccess(); }
+            catch (Exception ex) { _log.LogWarning($"[Session] InitRelayNetworkAccess: {ex.Message}"); }
+
+            _net = new SteamP2P();
+            _net.StartClient(_log, _lobbyHostId);
+            MultiplayerState.CurrentRole = MultiplayerState.Role.Client;
+            Phase = LobbyPhase.InGame;
+            _clientWaitingForSnapshot = true;
+
+            _net.OnConnectedToHost += () =>
+            {
+                _clientWaitingForConnect = false;
+                _handshakeAckReceived = false;
+                _lastSyncRequestTime = UnityEngine.Time.unscaledTime;
+                _syncRetryCount = 0;
+                _net.SendToHost(MessageType.Handshake, new HandshakeMessage
+                {
+                    PlayerName = playerName,
+                    ModVersion = PluginInfo.Version
+                });
+                _log.LogInfo("[Session] P2P connected to host, sent handshake");
+                LogEvent("Connected to host!");
+            };
+            _net.OnDisconnectedFromHost += () =>
+            {
+                _log.LogWarning("[Session] Disconnected from host");
+                LogEvent("Disconnected from host.");
+                Stop();
+            };
+            _net.OnMessageReceived += HandleClientMessage;
+
+            _log.LogInfo($"[Session] P2P connecting to {_lobbyHostId}...");
+            _clientWaitingForConnect = true;
+            _clientConnectTime = UnityEngine.Time.unscaledTime;
+        }
+
+        // ── Tick (called from Plugin.Update) ─────────
+
+        public void Tick()
+        {
+            // Note: SteamClient.RunCallbacks() is pumped by Plugin.Update() every frame.
+            // Do NOT call it again here to avoid double-pumping.
+
+            // Lobby-only phase: no P2P, just keep Steam callbacks flowing
+            if (Phase == LobbyPhase.InLobby)
+            {
+                // Client: poll lobby data to detect host launch
+                if (_lobby.HasValue && _lobbyHostId != 0)
+                {
+                    var state = _lobby.Value.GetData("state");
+                    if (state == "launching" || state == "ingame")
+                    {
+                        HandleLobbyLaunch();
+                    }
+                }
+                return;
+            }
+
+            // Launching phase: waiting for scene to load
+            if (Phase == LobbyPhase.Launching)
+            {
+                _net?.Poll();
+
+                // Client: scene loaded, poll lobby data until host signals "ingame"
+                if (_clientSceneReady && _net == null && _lobby.HasValue)
+                {
+                    var state = _lobby.Value.GetData("state");
+                    if (state == "ingame")
+                    {
+                        _log.LogInfo("[Session] Host is ready — connecting P2P...");
+                        ConnectP2PToHost(_pendingPlayerName ?? SteamClient.Name ?? "Player");
+                    }
+                }
+                return;
+            }
+
+            // Don't tick game state while waiting for scene load
+            if (_pendingHost)
+            {
+                _net?.Poll();
+                return;
+            }
+
+            // Client connection timeout
+            if (_clientWaitingForConnect)
+            {
+                _net?.Poll();
+                if (UnityEngine.Time.unscaledTime - _clientConnectTime > ConnectTimeoutSeconds)
+                {
+                    _log.LogWarning("[Session] Connection timed out");
+                    LogEvent("Connection timed out.");
+                    _clientWaitingForConnect = false;
+                    Stop();
+                }
+                return;
+            }
+
+            if (MultiplayerState.IsHost)
+                TickHost();
+            else if (MultiplayerState.IsClient)
+                TickClient();
+        }
+
+        private bool IsGameSceneReady()
+        {
+            // Check that the core singletons exist — they don't during scene transitions
+            return Singleton<EconomyManager>.Instance != null;
+        }
+
+        private void TickHost()
+        {
+            _net?.Poll();
+
+            if (!IsGameSceneReady()) return;
+
+            // Send deferred snapshots to clients who were accepted while scene was briefly unavailable
+            if (_pendingSnapshotClients.Count > 0)
+            {
+                var snapshot = BuildSnapshot();
+                foreach (var cid in _pendingSnapshotClients)
+                {
+                    _log.LogInfo($"[Session] Sending deferred snapshot to client {cid}");
+                    _net.SendToClient(cid, MessageType.FullSnapshot, snapshot);
+                }
+                _pendingSnapshotClients.Clear();
+            }
+
+            _tick++;
+
+            // Invalidate per-tick caches
+            _cachedCrateLookup = null;
+            _cachedBuildingLookup = null;
+
+            UpdateHostPlayerState();
+
+            // Detect ore changes by diffing AllOrePieces against known set
+            DetectOreChanges();
+
+            // Snapshot dirty state into pooled collections and reset immediately
+            _poolSpawnedOres.Clear();
+            _poolSpawnedOres.AddRange(DirtyTracker.SpawnedOrePieces);
+            _poolRemovedOreIds.Clear();
+            _poolRemovedOreIds.AddRange(DirtyTracker.RemovedOrePieceIds);
+            _poolRemovedBuildings.Clear();
+            _poolRemovedBuildings.AddRange(DirtyTracker.RemovedBuildings);
+            _poolDirtyMachines.Clear();
+            foreach (var id in DirtyTracker.DirtyMachineInstanceIds) _poolDirtyMachines.Add(id);
+            _poolDirtyBelts.Clear();
+            foreach (var id in DirtyTracker.DirtyBeltIds) _poolDirtyBelts.Add(id);
+            bool tickMoneyDirty = DirtyTracker.MoneyDirty;
+            bool tickResearchDirty = DirtyTracker.ResearchDirty;
+            bool tickQuestDirty = DirtyTracker.QuestDirty;
+            bool tickContractDirty = DirtyTracker.ContractDirty;
+            bool tickShopPurchaseDirty = DirtyTracker.ShopPurchaseDirty;
+            bool tickActiveQuestProgressDirty = DirtyTracker.ActiveQuestProgressDirty;
+            DirtyTracker.Reset();
+
+            // Batch ore spawn/remove events into single messages to reduce network overhead
+            if (_poolSpawnedOres.Count > 0)
+                _net.SendToAll(MessageType.OreSpawnedBatch, _poolSpawnedOres);
+            if (_poolRemovedOreIds.Count > 0)
+                _net.SendToAll(MessageType.OreRemovedBatch, _poolRemovedOreIds);
+
+            // Periodically send position updates for ores that have moved significantly
+            if (_tick % OrePositionSyncInterval == 0)
+            {
+                SendOrePositionUpdates();
+                SendCratePositionUpdates();
+            }
+
+            // Release ores that haven't been remotely updated recently
+            ReleaseStaleRemoteOres();
+
+            // Update debug bot position if active
+            if (_debugBotActive)
+                UpdateDebugBot();
+
+            // Host also needs to see remote player visuals
+            RemotePlayerManager.UpdatePlayers(_players, MultiplayerState.LocalPlayerId);
+
+            var delta = BuildDelta(_poolDirtyMachines, _poolDirtyBelts, _poolRemovedBuildings, tickMoneyDirty, tickResearchDirty, tickQuestDirty, tickContractDirty, tickShopPurchaseDirty, tickActiveQuestProgressDirty);
+            if (delta != null)
+            {
+                // Always send reliably — unreliable delivery over Steam relay was dropping
+                // position-only packets too aggressively, causing players to never update.
+                _net.SendToAll(MessageType.DeltaUpdate, delta);
+            }
+
+            // Inventory sync disabled — each player has their own independent inventory
+
+            if (_tick % HashCheckInterval == 0)
+            {
+                var snapshot = BuildSnapshot();
+                var hashVal = WorldHasher.ComputeHash(snapshot);
+                _log.LogInfo($"[Session] Host hash at tick {_tick}: {hashVal}  {WorldHasher.DiagnoseComponents(snapshot)}");
+                var hash = new WorldHash
+                {
+                    Tick = _tick,
+                    Hash = hashVal
+                };
+                _net.SendToAll(MessageType.HashCheck, hash);
+            }
+        }
+
+        /// <summary>Populate KnownOreIds with all current ores to prevent first-tick flood.</summary>
+        private void InitializeKnownOres()
+        {
+            DirtyTracker.KnownOreIds.Clear();
+            _hostOreInstanceToNetId.Clear();
+            _nextOreNetId = 1;
+            foreach (var ore in OrePiece.AllOrePieces)
+            {
+                if (ore == null) continue;
+                int id = ore.GetInstanceID();
+                DirtyTracker.KnownOreIds.Add(id);
+                _hostOreInstanceToNetId[id] = _nextOreNetId++;
+            }
+            _log.LogInfo($"[Session] Initialized {DirtyTracker.KnownOreIds.Count} known ores with network IDs");
+        }
+
+        /// <summary>Compare current OrePiece.AllOrePieces against known set to find spawned/removed.</summary>
+        private void DetectOreChanges()
+        {
+            _oreCurrentIds.Clear();
+
+            foreach (var ore in OrePiece.AllOrePieces)
+            {
+                if (ore == null) continue;
+                int id = ore.GetInstanceID();
+                _oreCurrentIds.Add(id);
+
+                if (!DirtyTracker.KnownOreIds.Contains(id))
+                {
+                    // Assign a network ID for this new ore
+                    int netId = _nextOreNetId++;
+                    _hostOreInstanceToNetId[id] = netId;
+
+                    var rb = ore.GetComponent<Rigidbody>();
+                    DirtyTracker.SpawnedOrePieces.Add(new OrePieceState
+                    {
+                        NetworkId = netId,
+                        ResourceType = (NetResourceType)(int)ore.ResourceType,
+                        PieceType = (NetPieceType)(int)ore.PieceType,
+                        IsPolished = ore.IsPolished,
+                        Position = new NetVector3(ore.transform.position),
+                        Rotation = new NetQuaternion(ore.transform.rotation),
+                        Velocity = rb != null ? new NetVector3(rb.linearVelocity) : default,
+                        SellValue = ore.GetSellValue()
+                    });
+                }
+            }
+
+            // Find removed ore — look up network IDs for cross-process sending
+            foreach (int knownId in DirtyTracker.KnownOreIds)
+            {
+                if (!_oreCurrentIds.Contains(knownId))
+                {
+                    if (_hostOreInstanceToNetId.TryGetValue(knownId, out int netId))
+                    {
+                        DirtyTracker.RemovedOrePieceIds.Add(netId); // network ID, not instance ID
+                        _hostOreInstanceToNetId.Remove(knownId);
+                    }
+                }
+            }
+
+            // Update known set for next tick
+            DirtyTracker.KnownOreIds.Clear();
+            foreach (int id in _oreCurrentIds)
+                DirtyTracker.KnownOreIds.Add(id);
+        }
+
+        /// <summary>Check all tracked ores for position changes and send batched updates to clients.</summary>
+        private void SendOrePositionUpdates()
+        {
+            _poolOrePositionUpdates.Clear();
+
+            foreach (var ore in OrePiece.AllOrePieces)
+            {
+                if (ore == null) continue;
+                int instanceId = ore.GetInstanceID();
+                if (!_hostOreInstanceToNetId.TryGetValue(instanceId, out int netId))
+                    continue;
+
+                var pos = ore.transform.position;
+                if (_lastSentOrePositions.TryGetValue(netId, out var lastPos))
+                {
+                    if (Vector3.SqrMagnitude(pos - lastPos) < OrePositionMoveThreshold * OrePositionMoveThreshold)
+                        continue;
+                }
+
+                _lastSentOrePositions[netId] = pos;
+                _poolOrePositionUpdates.Add(new OrePositionUpdate
+                {
+                    NetworkId = netId,
+                    Position = new NetVector3(pos),
+                    Rotation = new NetQuaternion(ore.transform.rotation)
+                });
+            }
+
+            // Clean up entries for removed ores
+            if (_poolOrePositionUpdates.Count > 0 || _poolRemovedOreIds.Count > 0)
+            {
+                foreach (var removedNetId in _poolRemovedOreIds)
+                    _lastSentOrePositions.Remove(removedNetId);
+            }
+
+            if (_poolOrePositionUpdates.Count > 0)
+                _net.SendToAll(MessageType.OrePositionBatch, _poolOrePositionUpdates);
+        }
+
+        /// <summary>Build and broadcast the authoritative tool list from the host's PlayerInventory.</summary>
+        private void BroadcastInventorySync()
+        {
+            var invMsg = BuildInventorySyncMessage();
+            if (invMsg != null)
+                _net.SendToAll(MessageType.InventorySync, invMsg);
+        }
+
+        /// <summary>Send the inventory sync to a specific client (e.g. after snapshot).</summary>
+        private void SendInventorySyncToClient(uint clientId)
+        {
+            var invMsg = BuildInventorySyncMessage();
+            if (invMsg != null)
+                _net.SendToClient(clientId, MessageType.InventorySync, invMsg);
+        }
+
+        /// <summary>Build an InventorySyncMessage from the host's PlayerInventory.</summary>
+        private InventorySyncMessage BuildInventorySyncMessage()
+        {
+            if (_cachedPlayerController == null)
+                _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
+            if (_cachedPlayerController == null) return null;
+
+            var inv = _cachedPlayerController.GetComponent<PlayerInventory>();
+            if (inv == null) return null;
+
+            var tools = new List<string>();
+            foreach (var tool in inv.Items)
+            {
+                if (tool == null) continue;
+                var name = tool.SavableObjectID.ToString();
+                // ToolBuilder is a building-mode indicator, not a persistent inventory tool
+                if (name == "ToolBuilder") continue;
+                tools.Add(name);
+            }
+
+            return new InventorySyncMessage { Tools = tools.ToArray() };
+        }
+
+        /// <summary>
+        /// Host: apply ore positions sent by a client who is grabbing/moving ores.
+        /// Finds the host-side ore by network ID and updates its position.
+        /// The host's own SendOrePositionUpdates will then relay to all clients.
+        /// </summary>
+        private void ApplyClientOrePositions(List<OrePositionUpdate> updates)
+        {
+            if (updates == null || updates.Count == 0) return;
+
+            // Build reverse lookup: netId → OrePiece (only for net IDs we need)
+            var needed = new HashSet<int>();
+            foreach (var upd in updates) needed.Add(upd.NetworkId);
+
+            var netIdToOre = new Dictionary<int, OrePiece>();
+            foreach (var kv in _hostOreInstanceToNetId)
+            {
+                if (!needed.Contains(kv.Value)) continue;
+                foreach (var ore in OrePiece.AllOrePieces)
+                {
+                    if (ore != null && ore.GetInstanceID() == kv.Key)
+                    {
+                        netIdToOre[kv.Value] = ore;
+                        break;
+                    }
+                }
+            }
+
+            foreach (var upd in updates)
+            {
+                if (netIdToOre.TryGetValue(upd.NetworkId, out var ore) && ore != null)
+                {
+                    ore.transform.position = upd.Position.ToUnity();
+                    ore.transform.rotation = upd.Rotation.ToUnity();
+                    var rb = ore.GetComponent<Rigidbody>();
+                    if (rb != null)
+                    {
+                        rb.isKinematic = true;
+                        rb.linearVelocity = Vector3.zero;
+                        rb.angularVelocity = Vector3.zero;
+                    }
+                    _remotelyHeldOres[upd.NetworkId] = UnityEngine.Time.unscaledTime;
+                }
+            }
+        }
+
+        /// <summary>Release ores back to physics after they've stopped being remotely updated.</summary>
+        private void ReleaseStaleRemoteOres()
+        {
+            if (_remotelyHeldOres.Count == 0) return;
+            var now = UnityEngine.Time.unscaledTime;
+            var toRelease = new List<int>();
+            foreach (var kv in _remotelyHeldOres)
+            {
+                if (now - kv.Value > RemoteHoldTimeout)
+                    toRelease.Add(kv.Key);
+            }
+            foreach (var netId in toRelease)
+            {
+                _remotelyHeldOres.Remove(netId);
+                // Find the ore and make it non-kinematic
+                OrePiece foundOre = null;
+                if (MultiplayerState.IsHost)
+                {
+                    foreach (var kv in _hostOreInstanceToNetId)
+                    {
+                        if (kv.Value != netId) continue;
+                        foreach (var ore in OrePiece.AllOrePieces)
+                        {
+                            if (ore != null && ore.GetInstanceID() == kv.Key)
+                            { foundOre = ore; break; }
+                        }
+                        break;
+                    }
+                }
+                else if (_clientOreByNetId.TryGetValue(netId, out var clientOre))
+                {
+                    foundOre = clientOre;
+                }
+                if (foundOre != null)
+                {
+                    var rb = foundOre.GetComponent<Rigidbody>();
+                    if (rb != null) rb.isKinematic = false;
+                }
+            }
+        }
+
+        // ── Client ore position tracking ──
+        private readonly Dictionary<int, Vector3> _clientLastSentOrePos = new Dictionary<int, Vector3>(); // netId → last sent pos
+        private readonly List<OrePositionUpdate> _clientOreUpdatePool = new List<OrePositionUpdate>();
+        /// <summary>Net IDs of ores the client is currently holding/moving locally. Skip host position updates for these.</summary>
+        private readonly HashSet<int> _clientLocallyHeldOres = new HashSet<int>();
+        // ── Client crate position tracking ──
+        private readonly Dictionary<int, Vector3> _clientLastSentCratePos = new Dictionary<int, Vector3>();
+        private readonly List<CratePositionUpdate> _clientCrateUpdatePool = new List<CratePositionUpdate>();
+
+        private void TickClient()
+        {
+            _net?.Poll();
+
+            // Retry handshake/sync if we've been waiting for world state
+            if (_clientWaitingForSnapshot && _net != null && _net.IsRunning)
+            {
+                float elapsed = UnityEngine.Time.unscaledTime - _lastSyncRequestTime;
+                if (elapsed >= SyncRetryInterval)
+                {
+                    _syncRetryCount++;
+                    _lastSyncRequestTime = UnityEngine.Time.unscaledTime;
+                    if (_syncRetryCount > MaxSyncRetries)
+                    {
+                        _log.LogError("[Session] Failed to receive world state from host after all retries. Disconnecting.");
+                        LogEvent("Failed to sync with host.");
+                        Stop();
+                        return;
+                    }
+                    if (!_handshakeAckReceived)
+                    {
+                        _log.LogWarning($"[Session] No handshake ack from host — resending handshake (attempt {_syncRetryCount}/{MaxSyncRetries})");
+                        _net.SendToHost(MessageType.Handshake, new HandshakeMessage
+                        {
+                            PlayerName = _pendingPlayerName ?? SteamClient.Name ?? "Player",
+                            ModVersion = PluginInfo.Version
+                        });
+                    }
+                    else
+                    {
+                        _log.LogWarning($"[Session] No snapshot from host — sending resync request (attempt {_syncRetryCount}/{MaxSyncRetries})");
+                        _net.SendToHost(MessageType.ResyncRequest, _tick);
+                    }
+                }
+                return; // Don't send position updates while waiting for snapshot
+            }
+
+            if (!IsGameSceneReady()) return;
+
+            // Process queued building spawns from reconciliation (batched across ticks)
+            ProcessPendingBuildingSpawns();
+
+            // Send position update every other tick (~10 times/sec at 20 tps)
+            _tick++;
+            if (_tick % 2 != 0) return;
+
+            if (_net != null && _net.IsRunning)
+            {
+                if (_cachedPlayerController == null)
+                    _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
+                if (_cachedPlayerController != null)
+                {
+                    _net.SendToHost(MessageType.PlayerInput, new PlayerInputMessage
+                    {
+                        PlayerId = MultiplayerState.LocalPlayerId,
+                        Position = new NetVector3(_cachedPlayerController.transform.position),
+                        Rotation = new NetQuaternion(_cachedPlayerController.transform.rotation),
+                        Sprinting = GetSprintState(_cachedPlayerController),
+                        ClientTick = _tick,
+                        EquippedTool = GetEquippedToolName(_cachedPlayerController),
+                        IsCrouching = GetCrouchState(_cachedPlayerController)
+                    });
+
+                    // Send position updates for ores the client is holding/moving
+                    SendClientOrePositions(_cachedPlayerController);
+                }
+                else if (_tick % 40 == 0) // Log every 2 seconds if controller is missing
+                {
+                    _log.LogWarning("[Session] PlayerController not found — cannot send position");
+                }
+            }
+
+            // Release ores that haven't been remotely updated recently
+            ReleaseStaleRemoteOres();
+        }
+
+        /// <summary>
+        /// Client: detect ores that the local player is holding/moving and send their
+        /// positions to the host. Checks PlayerController.HeldObject for hand-grabs
+        /// and scans nearby ores for magnet-held ones.
+        /// </summary>
+        private void SendClientOrePositions(PlayerController pc)
+        {
+            _clientOreUpdatePool.Clear();
+            _clientLocallyHeldOres.Clear();
+            _clientCrateUpdatePool.Clear();
+
+            // Check for hand-grabbed object
+            try
+            {
+                var heldObj = pc.HeldObject;
+                if (heldObj != null)
+                {
+                    var ore = heldObj.GetComponent<OrePiece>();
+                    if (ore != null)
+                        TryAddClientOreUpdate(ore);
+
+                    // Also check if the held object is a BreakableCrate
+                    var crate = heldObj.GetComponent<BreakableCrate>();
+                    if (crate != null)
+                        TryAddClientCrateUpdate(crate);
+                }
+            }
+            catch { /* HeldObject may not exist in this game version */ }
+
+            // Check for magnet-held ores: scan ores near the player that are moving
+            var playerPos = pc.transform.position;
+            foreach (var kv in _clientOreByNetId)
+            {
+                var ore = kv.Value;
+                if (ore == null) continue;
+
+                // Only check ores within magnet range (~5 units of player)
+                if (Vector3.SqrMagnitude(ore.transform.position - playerPos) > 25f) continue;
+
+                // Check if this ore has a SpringJoint (sign it's being grabbed or magneted)
+                var joint = ore.GetComponent<SpringJoint>();
+                if (joint != null)
+                    TryAddClientOreUpdate(ore);
+            }
+
+            if (_clientOreUpdatePool.Count > 0)
+                _net.SendToHost(MessageType.OrePositionBatch, _clientOreUpdatePool);
+
+            // Send crate position updates
+            if (_clientCrateUpdatePool.Count > 0)
+                _net.SendToHost(MessageType.CratePositionBatch, _clientCrateUpdatePool);
+        }
+
+        private void TryAddClientOreUpdate(OrePiece ore)
+        {
+            // Find network ID for this ore
+            int netId = -1;
+            foreach (var kv in _clientOreByNetId)
+            {
+                if (kv.Value == ore)
+                {
+                    netId = kv.Key;
+                    break;
+                }
+            }
+            if (netId < 0) return;
+
+            // Mark this ore as locally held so host position updates are skipped
+            _clientLocallyHeldOres.Add(netId);
+
+            // Make sure the ore is non-kinematic so the client can move it
+            var rb = ore.GetComponent<Rigidbody>();
+            if (rb != null && rb.isKinematic)
+                rb.isKinematic = false;
+
+            var pos = ore.transform.position;
+            if (_clientLastSentOrePos.TryGetValue(netId, out var lastPos))
+            {
+                if (Vector3.SqrMagnitude(pos - lastPos) < OrePositionMoveThreshold * OrePositionMoveThreshold)
+                    return;
+            }
+
+            _clientLastSentOrePos[netId] = pos;
+            _clientOreUpdatePool.Add(new OrePositionUpdate
+            {
+                NetworkId = netId,
+                Position = new NetVector3(pos),
+                Rotation = new NetQuaternion(ore.transform.rotation)
+            });
+        }
+
+        private void TryAddClientCrateUpdate(BreakableCrate crate)
+        {
+            int netId = -1;
+            foreach (var kv in _clientCrateByNetId)
+            {
+                if (kv.Value == crate) { netId = kv.Key; break; }
+            }
+            if (netId < 0) return;
+
+            var pos = crate.transform.position;
+            if (_clientLastSentCratePos.TryGetValue(netId, out var lastPos))
+            {
+                if (Vector3.SqrMagnitude(pos - lastPos) < OrePositionMoveThreshold * OrePositionMoveThreshold)
+                    return;
+            }
+
+            _clientLastSentCratePos[netId] = pos;
+            _clientCrateUpdatePool.Add(new CratePositionUpdate
+            {
+                NetworkId = netId,
+                Position = new NetVector3(pos),
+                Rotation = new NetQuaternion(crate.transform.rotation)
+            });
+        }
+
+        private void UpdateHostPlayerState()
+        {
+            var hostPlayer = _players.Find(p => p.PlayerId == 0);
+            if (hostPlayer == null) return;
+
+            if (_cachedPlayerController == null)
+                _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
+            var pc = _cachedPlayerController;
+            if (pc != null)
+            {
+                hostPlayer.Position = new NetVector3(pc.transform.position);
+                hostPlayer.Rotation = new NetQuaternion(pc.transform.rotation);
+                hostPlayer.EquippedTool = GetEquippedToolName(pc);
+                hostPlayer.IsCrouching = GetCrouchState(pc);
+            }
+
+            var eco = Singleton<EconomyManager>.Instance;
+            if (eco != null) hostPlayer.Money = eco.Money;
+
+            var research = Singleton<ResearchManager>.Instance;
+            if (research != null) hostPlayer.ResearchTickets = research.ResearchTickets;
+        }
+
+        /// <summary>Read the SavableObjectID name of the player's currently held tool via PlayerInventory.</summary>
+        private string _lastValidToolName;
+        private int _toolNullTicks;
+        private const int ToolNullDebounce = 20; // ~1s at 20tps before clearing tool
+
+        private string GetEquippedToolName(PlayerController pc)
+        {
+            try
+            {
+                var inv = pc.GetComponent<PlayerInventory>();
+                if (inv == null) return _lastValidToolName;
+                var tool = inv.ActiveTool;
+                if (tool == null)
+                {
+                    // Debounce: only clear after several consecutive null ticks
+                    _toolNullTicks++;
+                    if (_toolNullTicks >= ToolNullDebounce)
+                        _lastValidToolName = null;
+                    return _lastValidToolName;
+                }
+                _toolNullTicks = 0;
+                var name = tool.SavableObjectID.ToString();
+                _lastValidToolName = name;
+                // Periodic debug log every ~15 seconds (300 ticks at 20tps)
+                if (_tick % 300 == 0)
+                    _log.LogInfo($"[Session] EquippedTool: '{name}' (Items={inv.Items?.Count ?? 0})");
+                return name;
+            }
+            catch { return _lastValidToolName; }
+        }
+
+        private static bool GetSprintState(PlayerController pc)
+        {
+            try
+            {
+                // Access sprint property via reflection to avoid compile error if API varies
+                var prop = pc.GetType().GetProperty("IsSprinting")
+                    ?? pc.GetType().GetProperty("isSprinting");
+                if (prop != null) return (bool)prop.GetValue(pc);
+
+                var field = pc.GetType().GetField("IsSprinting")
+                    ?? pc.GetType().GetField("isSprinting")
+                    ?? pc.GetType().GetField("_isSprinting");
+                if (field != null) return (bool)field.GetValue(pc);
+            }
+            catch { /* property may not exist in this game version */ }
+            return false;
+        }
+
+        private static bool GetCrouchState(PlayerController pc)
+        {
+            try
+            {
+                var prop = pc.GetType().GetProperty("IsCrouching")
+                    ?? pc.GetType().GetProperty("isCrouching");
+                if (prop != null) return (bool)prop.GetValue(pc);
+
+                var field = pc.GetType().GetField("IsCrouching")
+                    ?? pc.GetType().GetField("isCrouching")
+                    ?? pc.GetType().GetField("_isCrouching");
+                if (field != null) return (bool)field.GetValue(pc);
+            }
+            catch { /* property may not exist in this game version */ }
+            return false;
+        }
+
+        // ── Host message router ──────────────────────
+
+        private void HandleHostMessage(uint clientId, MessageType type, byte[] payload)
+        {
+            try
+            {
+                switch (type)
+                {
+                    case MessageType.Handshake:
+                        var hs = NetSerializer.Deserialize<HandshakeMessage>(payload);
+                        HandlePlayerJoined(clientId, hs);
+                        break;
+                    case MessageType.PlayerInput:
+                        var input = NetSerializer.Deserialize<PlayerInputMessage>(payload);
+                        HandlePlayerInput(clientId, input);
+                        break;
+                    case MessageType.PlaceBuilding:
+                        var place = NetSerializer.Deserialize<PlaceBuildingMessage>(payload);
+                        HandlePlaceBuilding(clientId, place);
+                        break;
+                    case MessageType.RemoveBuilding:
+                        var remove = NetSerializer.Deserialize<RemoveBuildingMessage>(payload);
+                        HandleRemoveBuilding(clientId, remove);
+                        break;
+                    case MessageType.MineNode:
+                        var mine = NetSerializer.Deserialize<MineNodeMessage>(payload);
+                        HandleMineNode(clientId, mine);
+                        break;
+                    case MessageType.CrateDamage:
+                        var crate = NetSerializer.Deserialize<CrateDamageMessage>(payload);
+                        HandleCrateDamage(clientId, crate);
+                        break;
+                    case MessageType.ResearchItem:
+                        var research = NetSerializer.Deserialize<ResearchItemMessage>(payload);
+                        HandleResearchItem(clientId, research);
+                        break;
+                    case MessageType.InteractBuilding:
+                        var interact = NetSerializer.Deserialize<InteractBuildingMessage>(payload);
+                        HandleInteractBuilding(clientId, interact);
+                        break;
+                    case MessageType.ResyncRequest:
+                        _log.LogInfo($"[Session] Client {clientId} requested resync");
+                        if (IsGameSceneReady())
+                        {
+                            var resyncSnap = BuildSnapshot();
+                            var hostDiag = WorldHasher.DiagnoseComponents(resyncSnap);
+                            _log.LogInfo($"[Session] Host snapshot for resync: {hostDiag}");
+                            _net.SendToClient(clientId, MessageType.FullSnapshot, resyncSnap);
+                        }
+                        break;
+                    case MessageType.OrePositionBatch:
+                        var clientOrePos = NetSerializer.Deserialize<List<OrePositionUpdate>>(payload);
+                        ApplyClientOrePositions(clientOrePos);
+                        break;
+                    case MessageType.CratePositionBatch:
+                        var clientCratePos = NetSerializer.Deserialize<List<CratePositionUpdate>>(payload);
+                        ApplyClientCratePositions(clientCratePos);
+                        break;
+                    case MessageType.ShopPurchaseNotify:
+                        var purchaseMsg = NetSerializer.Deserialize<ShopPurchaseNotifyMessage>(payload);
+                        HandleShopPurchaseNotify(clientId, purchaseMsg);
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Session] Error handling host message {type} from client {clientId}: {ex}");
+            }
+        }
+
+        // ── Client message router ────────────────────
+
+        private void HandleClientMessage(uint _, MessageType type, byte[] payload)
+        {
+            try
+            {
+                switch (type)
+                {
+                    case MessageType.HandshakeAck:
+                        var ack = NetSerializer.Deserialize<HandshakeAckMessage>(payload);
+                        if (!ack.Accepted)
+                        {
+                            var reason = !string.IsNullOrEmpty(ack.RejectionReason) ? ack.RejectionReason : "Rejected by host";
+                            _log.LogWarning($"[Session] Handshake rejected: {reason}");
+                            LogEvent($"Rejected: {reason}");
+                            Stop();
+                            break;
+                        }
+                        _handshakeAckReceived = true;
+                        _log.LogInfo($"[Session] Handshake accepted, assigned player ID {ack.AssignedPlayerId}");
+                        MultiplayerState.LocalPlayerId = ack.AssignedPlayerId;
+                        // Load the host's gameplay scene if we're not already in it
+                        if (!string.IsNullOrEmpty(ack.SceneName) && SceneManager.GetActiveScene().name != ack.SceneName)
+                        {
+                            _clientLoadingScene = true;
+                            _log.LogInfo($"[Session] Loading host scene '{ack.SceneName}'...");
+                            LogEvent("Loading level...");
+                            SceneManager.LoadScene(ack.SceneName);
+                        }
+                        break;
+                    case MessageType.FullSnapshot:
+                        if (_clientLoadingScene) break;
+                        _clientWaitingForSnapshot = false;
+                        _log.LogInfo($"[Session] Received FullSnapshot ({payload?.Length ?? 0} bytes)");
+                        var snap = NetSerializer.Deserialize<WorldSnapshot>(payload);
+                        ApplySnapshot(snap);
+                        break;
+                    case MessageType.DeltaUpdate:
+                        if (_clientLoadingScene || _clientWaitingForSnapshot) break;
+                        var delta = NetSerializer.Deserialize<WorldDelta>(payload);
+                        ApplyDelta(delta);
+                        break;
+                    case MessageType.HashCheck:
+                        if (_clientLoadingScene || _clientWaitingForSnapshot) break;
+                        var hash = NetSerializer.Deserialize<WorldHash>(payload);
+                        CheckHash(hash);
+                        break;
+                    case MessageType.BuildingSpawned:
+                        if (_clientWaitingForSnapshot) break;
+                        var bld = NetSerializer.Deserialize<BuildingState>(payload);
+                        OnRemoteBuildingSpawned(bld);
+                        break;
+                    case MessageType.BuildingRemoved:
+                        if (_clientWaitingForSnapshot) break;
+                        var bldRemoval = NetSerializer.Deserialize<BuildingRemovalInfo>(payload);
+                        OnRemoteBuildingRemoved(bldRemoval);
+                        break;
+                    case MessageType.OreSpawned:
+                        if (_clientWaitingForSnapshot) break;
+                        var ore = NetSerializer.Deserialize<OrePieceState>(payload);
+                        OnRemoteOreSpawned(ore);
+                        break;
+                    case MessageType.OreRemoved:
+                        if (_clientWaitingForSnapshot) break;
+                        var oreId = NetSerializer.Deserialize<int>(payload);
+                        OnRemoteOreRemoved(oreId);
+                        break;
+                    case MessageType.OreSpawnedBatch:
+                        if (_clientWaitingForSnapshot) break;
+                        var oreBatch = NetSerializer.Deserialize<List<OrePieceState>>(payload);
+                        foreach (var o in oreBatch) OnRemoteOreSpawned(o);
+                        break;
+                    case MessageType.OreRemovedBatch:
+                        if (_clientWaitingForSnapshot) break;
+                        var oreIdBatch = NetSerializer.Deserialize<List<int>>(payload);
+                        foreach (var id in oreIdBatch) OnRemoteOreRemoved(id);
+                        break;
+                    case MessageType.MineNode:
+                        if (_clientWaitingForSnapshot) break;
+                        var mineMsg = NetSerializer.Deserialize<MineNodeMessage>(payload);
+                        ApplyRemoteMining(mineMsg);
+                        break;
+                    case MessageType.CrateDamage:
+                        if (_clientWaitingForSnapshot) break;
+                        var crateMsg = NetSerializer.Deserialize<CrateDamageMessage>(payload);
+                        ApplyRemoteCrateDamage(crateMsg);
+                        break;
+                    case MessageType.OrePositionBatch:
+                        if (_clientWaitingForSnapshot) break;
+                        var posUpdates = NetSerializer.Deserialize<List<OrePositionUpdate>>(payload);
+                        ApplyOrePositionUpdates(posUpdates);
+                        break;
+                    case MessageType.CratePositionBatch:
+                        if (_clientWaitingForSnapshot) break;
+                        var crateUpdates = NetSerializer.Deserialize<List<CratePositionUpdate>>(payload);
+                        ApplyCratePositionUpdates(crateUpdates);
+                        break;
+                    case MessageType.InventorySync:
+                        // Inventory sync disabled — each player manages their own inventory
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Session] Error handling client message {type}: {ex}");
+            }
+        }
+
+        // ── Host event handlers ──────────────────────
+
+        private void HandleClientConnected(uint clientId)
+        {
+            _log.LogInfo($"[Session] Steam client {clientId} connected, awaiting handshake...");
+        }
+
+        private void HandleClientDisconnected(uint clientId)
+        {
+            _pendingSnapshotClients.Remove(clientId);
+            string name = "Unknown";
+            if (_clientNames.TryGetValue(clientId, out var n))
+            {
+                name = n;
+                _clientNames.Remove(clientId);
+            }
+            _players.RemoveAll(p => p.PlayerId == (int)clientId);
+            _log.LogInfo($"[Session] Player '{name}' (ID {clientId}) left");
+            LogLeave(name);
+        }
+
+        private void HandlePlayerJoined(uint clientId, HandshakeMessage handshake)
+        {
+            _log.LogInfo($"[Session] Received handshake from client {clientId}: '{handshake.PlayerName}' v{handshake.ModVersion}");
+
+            // If this client already completed handshake, resend ack + snapshot (retry case)
+            if (_clientNames.ContainsKey(clientId))
+            {
+                _log.LogInfo($"[Session] Client {clientId} already joined — resending ack and snapshot");
+                _net.SendToClient(clientId, MessageType.HandshakeAck, new HandshakeAckMessage
+                {
+                    AssignedPlayerId = (int)clientId,
+                    Accepted = true,
+                    SceneName = SceneManager.GetActiveScene().name
+                });
+                if (IsGameSceneReady())
+                {
+                    var resnapshot = BuildSnapshot();
+                    _log.LogInfo($"[Session] Sending snapshot to already-joined client {clientId}");
+                    _net.SendToClient(clientId, MessageType.FullSnapshot, resnapshot);
+                }
+                return;
+            }
+
+            // Reject if host scene is still loading
+            if (_pendingHost)
+            {
+                _log.LogInfo($"[Session] Player '{handshake.PlayerName}' connected while scene loading — rejecting with retry hint");
+                _net.SendToClient(clientId, MessageType.HandshakeAck, new HandshakeAckMessage
+                {
+                    AssignedPlayerId = -1,
+                    Accepted = false,
+                    RejectionReason = "Host is still loading. Please try again in a moment."
+                });
+                return;
+            }
+
+            // Version mismatch check
+            if (!string.IsNullOrEmpty(handshake.ModVersion) && handshake.ModVersion != PluginInfo.Version)
+            {
+                _log.LogWarning($"[Session] Player '{handshake.PlayerName}' has mod version {handshake.ModVersion}, expected {PluginInfo.Version}");
+                _net.SendToClient(clientId, MessageType.HandshakeAck, new HandshakeAckMessage
+                {
+                    AssignedPlayerId = -1,
+                    Accepted = false,
+                    RejectionReason = $"Version mismatch: you have {handshake.ModVersion}, host has {PluginInfo.Version}"
+                });
+                return;
+            }
+
+            // 4-player limit check
+            if (_players.Count >= MaxPlayers)
+            {
+                _log.LogWarning($"[Session] Player '{handshake.PlayerName}' rejected: server full ({_players.Count}/{MaxPlayers})");
+                _net.SendToClient(clientId, MessageType.HandshakeAck, new HandshakeAckMessage
+                {
+                    AssignedPlayerId = -1,
+                    Accepted = false,
+                    RejectionReason = $"Server full ({_players.Count}/{MaxPlayers} players)"
+                });
+                return;
+            }
+
+            _clientNames[clientId] = handshake.PlayerName;
+            _players.Add(new PlayerState
+            {
+                PlayerId = (int)clientId,
+                DisplayName = handshake.PlayerName
+            });
+
+            // Send ack with assigned ID and the scene the client needs to load
+            var ackMsg = new HandshakeAckMessage
+            {
+                AssignedPlayerId = (int)clientId,
+                Accepted = true,
+                SceneName = SceneManager.GetActiveScene().name
+            };
+            _net.SendToClient(clientId, MessageType.HandshakeAck, ackMsg);
+            _log.LogInfo($"[Session] Sent HandshakeAck to client {clientId} (scene='{ackMsg.SceneName}')");
+
+            // Send full snapshot if scene is ready, otherwise queue for next tick
+            if (IsGameSceneReady())
+            {
+                var snapshot = BuildSnapshot();
+                _log.LogInfo($"[Session] Sending FullSnapshot to client {clientId}");
+                _net.SendToClient(clientId, MessageType.FullSnapshot, snapshot);
+            }
+            else
+            {
+                _pendingSnapshotClients.Add(clientId);
+                _log.LogInfo($"[Session] Scene not ready — queued snapshot for client {clientId}");
+            }
+
+            _log.LogInfo($"[Session] Player '{handshake.PlayerName}' (ID {clientId}) joined");
+            LogJoin(handshake.PlayerName);
+        }
+
+        private void HandlePlayerInput(uint clientId, PlayerInputMessage input)
+        {
+            var player = _players.Find(p => p.PlayerId == (int)clientId);
+            if (player == null) return;
+            player.Position = input.Position;
+            player.Rotation = input.Rotation;
+            player.EquippedTool = input.EquippedTool;
+            player.IsCrouching = input.IsCrouching;
+        }
+
+        private void HandlePlaceBuilding(uint clientId, PlaceBuildingMessage msg)
+        {
+            _log.LogInfo($"[Session] Player {clientId} placing '{msg.SavableObjectId}' at {msg.Position}");
+
+            if (!System.Enum.TryParse<SavableObjectID>(msg.SavableObjectId, out var savableId))
+            {
+                _log.LogWarning($"[Session] Unknown SavableObjectID: {msg.SavableObjectId}");
+                return;
+            }
+
+            var slm = Singleton<SavingLoadingManager>.Instance;
+            if (slm == null) return;
+
+            var prefab = slm.GetPrefab(savableId);
+            if (prefab == null)
+            {
+                _log.LogWarning($"[Session] No prefab found for {savableId}");
+                return;
+            }
+
+            var pos = msg.Position.ToUnity();
+            var rot = msg.Rotation.ToUnity();
+
+            BuildingPatch.NetworkBypass = true;
+            try
+            {
+                var go = UnityEngine.Object.Instantiate(prefab, pos, rot);
+                var bo = go.GetComponent<BuildingObject>();
+                if (bo != null)
+                {
+                    // Broadcast the new building to all clients
+                    var state = new BuildingState
+                    {
+                        LocalInstanceId = bo.GetInstanceID(),
+                        SavableObjectId = msg.SavableObjectId,
+                        Position = msg.Position,
+                        Rotation = msg.Rotation
+                    };
+                    _net.SendToAll(MessageType.BuildingSpawned, state);
+                }
+            }
+            finally { BuildingPatch.NetworkBypass = false; }
+        }
+
+        private void HandleRemoveBuilding(uint clientId, RemoveBuildingMessage msg)
+        {
+            _log.LogInfo($"[Session] Player {clientId} removing building '{msg.SavableObjectId}' at {msg.Position}");
+            foreach (var bo in UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None))
+            {
+                if (bo.SavableObjectID.ToString() == msg.SavableObjectId &&
+                    Vector3.Distance(bo.transform.position, msg.Position.ToUnity()) < 0.15f)
+                {
+                    BuildingPatch.NetworkBypass = true;
+                    try { bo.TryTakeOrPack(); }
+                    finally { BuildingPatch.NetworkBypass = false; }
+
+                    var removalInfo = new BuildingRemovalInfo
+                    {
+                        Position = new NetVector3(bo.transform.position),
+                        SavableObjectId = msg.SavableObjectId
+                    };
+                    DirtyTracker.RemovedBuildings.Add(removalInfo);
+
+                    // Broadcast removal to all clients
+                    _net.SendToAll(MessageType.BuildingRemoved, removalInfo);
+                    break;
+                }
+            }
+        }
+
+        private void HandleMineNode(uint clientId, MineNodeMessage msg)
+        {
+            _log.LogInfo($"[Session] Player {clientId} mining at {msg.NodePosition}");
+            OreNode closest = null;
+            float closestDist = float.MaxValue;
+            foreach (var node in UnityEngine.Object.FindObjectsByType<OreNode>(FindObjectsSortMode.None))
+            {
+                float dist = Vector3.Distance(node.transform.position, msg.NodePosition.ToUnity());
+                if (dist < closestDist)
+                {
+                    closestDist = dist;
+                    closest = node;
+                }
+            }
+            if (closest != null && closestDist < 1f)
+            {
+                MiningPatch.NetworkBypass = true;
+                try { closest.TakeDamage(msg.Damage, msg.HitPosition.ToUnity()); }
+                finally { MiningPatch.NetworkBypass = false; }
+            }
+        }
+
+        private void HandleCrateDamage(uint clientId, CrateDamageMessage msg)
+        {
+            _log.LogInfo($"[Session] Player {clientId} hitting crate at {msg.CratePosition}");
+            BreakableCrate closest = null;
+            float closestDist = float.MaxValue;
+            foreach (var crate in UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None))
+            {
+                float dist = Vector3.Distance(crate.transform.position, msg.CratePosition.ToUnity());
+                if (dist < closestDist)
+                {
+                    closestDist = dist;
+                    closest = crate;
+                }
+            }
+            if (closest != null && closestDist < 2f)
+            {
+                // Capture position before TakeDamage (crate may be destroyed)
+                var cratePos = new NetVector3(closest.transform.position);
+
+                Patches.MachineProcessingPatch.CrateNetworkBypass = true;
+                try { closest.TakeDamage(msg.Damage, msg.HitPosition.ToUnity()); }
+                finally { Patches.MachineProcessingPatch.CrateNetworkBypass = false; }
+
+                // Broadcast to ALL clients so they see the damage/break.
+                // Crates are NOT tracked in building snapshots or delta sync —
+                // this broadcast is the ONLY way clients learn about crate state changes.
+                BroadcastCrateDamage(cratePos, msg.Damage, msg.HitPosition);
+            }
+        }
+
+        private void HandleResearchItem(uint clientId, ResearchItemMessage msg)
+        {
+            _log.LogInfo($"[Session] Player {clientId} researching '{msg.ResearchItemId}'");
+            var research = Singleton<ResearchManager>.Instance;
+            if (research == null) return;
+
+            if (!System.Enum.TryParse<SavableObjectID>(msg.ResearchItemId, out var savableId))
+            {
+                _log.LogWarning($"[Session] Unknown research ID: {msg.ResearchItemId}");
+                return;
+            }
+
+            var itemDef = research.GetResearchItemByID(savableId);
+            if (itemDef == null)
+            {
+                _log.LogWarning($"[Session] No ResearchItemDefinition for {savableId}");
+                return;
+            }
+
+            ResearchPatch.NetworkBypass = true;
+            try
+            {
+                research.ResearchItem(itemDef);
+                DirtyTracker.ResearchDirty = true;
+            }
+            finally { ResearchPatch.NetworkBypass = false; }
+        }
+
+        private void HandleInteractBuilding(uint clientId, InteractBuildingMessage msg)
+        {
+            _log.LogInfo($"[Session] Player {clientId} interacting '{msg.Action}' at {msg.Position}");
+
+            // Find the closest building to the given position
+            BuildingObject target = null;
+            float closest = 1.0f;
+            foreach (var bo in UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None))
+            {
+                if (bo.IsGhost) continue;
+                float dist = Vector3.Distance(bo.transform.position, msg.Position.ToUnity());
+                if (dist < closest)
+                {
+                    closest = dist;
+                    target = bo;
+                }
+            }
+            if (target == null)
+            {
+                _log.LogWarning($"[Session] No building found near {msg.Position} for action '{msg.Action}'");
+                return;
+            }
+
+            switch (msg.Action)
+            {
+                case "toggle":
+                    var belt = target.GetComponent<ConveyorBelt>();
+                    if (belt != null)
+                    {
+                        belt.Disabled = !belt.Disabled;
+                        DirtyTracker.DirtyBeltIds.Add(belt.GetInstanceID());
+                    }
+                    break;
+
+                case "toggleAutoMiner":
+                    var miner = target.GetComponent<AutoMiner>();
+                    if (miner != null)
+                    {
+                        BuildingInteractionPatch.NetworkBypass = true;
+                        try { miner.Toggle(!miner.Enabled); }
+                        finally { BuildingInteractionPatch.NetworkBypass = false; }
+                        DirtyTracker.DirtyMachineInstanceIds.Add(target.GetInstanceID());
+                    }
+                    break;
+
+                case "toggleHatch":
+                    var hatch = target.GetComponent<ChuteHatch>();
+                    if (hatch != null)
+                    {
+                        BuildingInteractionPatch.NetworkBypass = true;
+                        try { hatch.SetDirection(!hatch.IsClosed); }
+                        finally { BuildingInteractionPatch.NetworkBypass = false; }
+                        DirtyTracker.DirtyMachineInstanceIds.Add(target.GetInstanceID());
+                    }
+                    break;
+
+                case "toggleBlocker":
+                    var blocker = target.GetComponent<ConveyorBlockerT2>();
+                    if (blocker != null)
+                    {
+                        BuildingInteractionPatch.NetworkBypass = true;
+                        try { blocker.Toggle(); }
+                        finally { BuildingInteractionPatch.NetworkBypass = false; }
+                        DirtyTracker.DirtyMachineInstanceIds.Add(target.GetInstanceID());
+                    }
+                    break;
+
+                case "editSign":
+                    var sign = target.GetComponent<EditableSign>();
+                    if (sign != null)
+                    {
+                        BuildingInteractionPatch.NetworkBypass = true;
+                        try { sign.UpdateText(msg.Data ?? ""); }
+                        finally { BuildingInteractionPatch.NetworkBypass = false; }
+                        DirtyTracker.DirtyMachineInstanceIds.Add(target.GetInstanceID());
+                    }
+                    break;
+
+                case "triggerDetonator":
+                    var trigger = target.GetComponent<DetonatorTrigger>();
+                    if (trigger != null && !trigger.HasTriggered)
+                    {
+                        BuildingInteractionPatch.NetworkBypass = true;
+                        try
+                        {
+                            // Call Interact with null — TriggerExplosion is private, Interact calls it
+                            trigger.Interact(null);
+                        }
+                        finally { BuildingInteractionPatch.NetworkBypass = false; }
+                    }
+                    break;
+
+                case "buyDetonator":
+                    var buySign = target.GetComponent<DetonatorBuySign>();
+                    if (buySign != null)
+                    {
+                        EconomyPatch.NetworkBypass = true;
+                        BuildingInteractionPatch.NetworkBypass = true;
+                        try { buySign.TryBuySign(); }
+                        finally
+                        {
+                            EconomyPatch.NetworkBypass = false;
+                            BuildingInteractionPatch.NetworkBypass = false;
+                        }
+                        DirtyTracker.MoneyDirty = true;
+                    }
+                    break;
+
+                default:
+                    // Fallback: mark machine dirty for CustomSaveData propagation
+                    if (target is ICustomSaveDataProvider)
+                        DirtyTracker.DirtyMachineInstanceIds.Add(target.GetInstanceID());
+                    break;
+            }
+        }
+
+        // ── Client state application ─────────────────
+
+        private void ApplySnapshot(WorldSnapshot snapshot)
+        {
+            _log.LogInfo($"[Session] Received snapshot at tick {snapshot.Tick}");
+            LogEvent("Received world snapshot from host.");
+
+            if (snapshot.World != null)
+            {
+                EconomyPatch.NetworkBypass = true;
+                ResearchPatch.NetworkBypass = true;
+                try
+                {
+                    var eco = Singleton<EconomyManager>.Instance;
+                    var research = Singleton<ResearchManager>.Instance;
+                    if (eco != null) eco.SetMoney(snapshot.World.Money);
+                    if (research != null)
+                    {
+                        // Sync completed research using the game's save-load API
+                        if (snapshot.World.CompletedResearchIds != null)
+                        {
+                            var completedIds = new List<SavableObjectID>();
+                            foreach (var idStr in snapshot.World.CompletedResearchIds)
+                            {
+                                if (System.Enum.TryParse<SavableObjectID>(idStr, out var sid))
+                                    completedIds.Add(sid);
+                            }
+                            research.LoadFromSaveFile(completedIds);
+                        }
+                        research.SetResearchTickets(snapshot.World.ResearchTickets);
+                    }
+                }
+                finally
+                {
+                    EconomyPatch.NetworkBypass = false;
+                    ResearchPatch.NetworkBypass = false;
+                }
+
+                // Sync quest completions (QuestID enum, not SavableObjectID)
+                var quests = Singleton<QuestManager>.Instance;
+                if (quests != null)
+                {
+                    QuestPatch.NetworkBypass = true;
+                    try
+                    {
+                        if (snapshot.World.CompletedQuestIds != null)
+                        {
+                            var hostCompleted = new HashSet<QuestID>();
+                            foreach (var idStr in snapshot.World.CompletedQuestIds)
+                            {
+                                if (System.Enum.TryParse<QuestID>(idStr, out var qid))
+                                    hostCompleted.Add(qid);
+                            }
+                            foreach (var quest in quests.AllQuests)
+                            {
+                                if (hostCompleted.Contains(quest.QuestID) && !quest.IsCompleted())
+                                    quest.UnlockFromLoadingSaveFile();
+                            }
+                        }
+
+                        // Activate and sync progress for active quests
+                        if (snapshot.World.ActiveQuests != null)
+                        {
+                            foreach (var aq in snapshot.World.ActiveQuests)
+                            {
+                                if (System.Enum.TryParse<QuestID>(aq.QuestId, out var qid))
+                                {
+                                    var quest = quests.GetQuestByID(qid);
+                                    if (quest != null && !quest.IsActive() && !quest.IsCompleted())
+                                        quests.ForceActivateQuest(qid);
+                                }
+                            }
+                            ApplyActiveQuestProgress(quests, snapshot.World.ActiveQuests);
+                        }
+                    }
+                    finally { QuestPatch.NetworkBypass = false; }
+                }
+
+                // Sync shop purchases
+                var eco2 = Singleton<EconomyManager>.Instance;
+                if (snapshot.World.ShopPurchases != null && eco2?.ShopPurchases != null)
+                {
+                    eco2.ShopPurchases.Purchases.Clear();
+                    foreach (var sp in snapshot.World.ShopPurchases)
+                    {
+                        if (System.Enum.TryParse<SavableObjectID>(sp.SavableObjectId, out var sid))
+                            eco2.ShopPurchases.Purchases.Add(
+                                new ShopObjectPurchaseEntry { SavableObjectID = sid, AmountPurchased = sp.Amount });
+                    }
+                }
+
+                // Sync contracts
+                var contracts = Singleton<ContractsManager>.Instance;
+                if (contracts != null)
+                    ApplyContractState(contracts, snapshot.World);
+            }
+
+            // Update remote player visuals
+            if (snapshot.Players != null)
+                RemotePlayerManager.UpdatePlayers(snapshot.Players, MultiplayerState.LocalPlayerId);
+
+            // Apply conveyor states
+            if (snapshot.Conveyors != null)
+                ApplyConveyorStates(snapshot.Conveyors);
+
+            // Reconcile buildings: spawn missing, remove extras
+            if (snapshot.Buildings != null)
+                ReconcileBuildingsFromSnapshot(snapshot.Buildings);
+
+            // Reconcile ores: clear local, respawn from host
+            if (snapshot.OrePieces != null)
+                ReconcileOresFromSnapshot(snapshot.OrePieces);
+
+            // Reconcile crate positions from host
+            if (snapshot.Crates != null)
+                ReconcileCratesFromSnapshot(snapshot.Crates);
+        }
+
+        private bool _loggedFirstDelta;
+
+        private void ApplyDelta(WorldDelta delta)
+        {
+            // Log the first delta with player data so we can confirm sync is working
+            if (!_loggedFirstDelta && delta.PlayerUpdates != null && delta.PlayerUpdates.Count > 0)
+            {
+                _loggedFirstDelta = true;
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[Session] First delta received with {delta.PlayerUpdates.Count} players: ");
+                foreach (var p in delta.PlayerUpdates)
+                    sb.Append($"P{p.PlayerId}=({p.Position.X:F1},{p.Position.Y:F1},{p.Position.Z:F1}) ");
+                _log.LogInfo(sb.ToString());
+            }
+
+            if (delta.World != null)
+            {
+                EconomyPatch.NetworkBypass = true;
+                ResearchPatch.NetworkBypass = true;
+                try
+                {
+                    var eco = Singleton<EconomyManager>.Instance;
+                    var research = Singleton<ResearchManager>.Instance;
+                    if (eco != null) eco.SetMoney(delta.World.Money);
+                    if (research != null)
+                    {
+                        // Sync research whenever the host set differs from local
+                        if (delta.World.CompletedResearchIds != null)
+                        {
+                            var completedIds = new List<SavableObjectID>();
+                            foreach (var idStr in delta.World.CompletedResearchIds)
+                            {
+                                if (System.Enum.TryParse<SavableObjectID>(idStr, out var sid))
+                                    completedIds.Add(sid);
+                            }
+                            // Only reload if the set actually differs (content comparison)
+                            var localSet = new HashSet<SavableObjectID>(research.CompletedResearchItems);
+                            var hostSet = new HashSet<SavableObjectID>(completedIds);
+                            if (!localSet.SetEquals(hostSet))
+                                research.LoadFromSaveFile(completedIds);
+                        }
+                        research.SetResearchTickets(delta.World.ResearchTickets);
+                    }
+
+                    // Sync quest completions (QuestID enum, not SavableObjectID)
+                    var quests = Singleton<QuestManager>.Instance;
+                    if (quests != null && delta.World.CompletedQuestIds != null)
+                    {
+                        QuestPatch.NetworkBypass = true;
+                        try
+                        {
+                            var hostCompleted = new HashSet<QuestID>();
+                            foreach (var idStr in delta.World.CompletedQuestIds)
+                            {
+                                if (System.Enum.TryParse<QuestID>(idStr, out var qid))
+                                    hostCompleted.Add(qid);
+                            }
+                            foreach (var quest in quests.AllQuests)
+                            {
+                                if (hostCompleted.Contains(quest.QuestID) && !quest.IsCompleted())
+                                    quest.UnlockFromLoadingSaveFile();
+                            }
+
+                            // Activate and sync progress for active quests
+                            if (delta.World.ActiveQuests != null)
+                            {
+                                foreach (var aq in delta.World.ActiveQuests)
+                                {
+                                    if (System.Enum.TryParse<QuestID>(aq.QuestId, out var qid))
+                                    {
+                                        var quest = quests.GetQuestByID(qid);
+                                        if (quest != null && !quest.IsActive() && !quest.IsCompleted())
+                                            quests.ForceActivateQuest(qid);
+                                    }
+                                }
+                                ApplyActiveQuestProgress(quests, delta.World.ActiveQuests);
+                            }
+                        }
+                        finally { QuestPatch.NetworkBypass = false; }
+                    }
+
+                    // Sync shop purchases
+                    if (delta.World.ShopPurchases != null && eco?.ShopPurchases != null)
+                    {
+                        eco.ShopPurchases.Purchases.Clear();
+                        foreach (var sp in delta.World.ShopPurchases)
+                        {
+                            if (System.Enum.TryParse<SavableObjectID>(sp.SavableObjectId, out var sid))
+                                eco.ShopPurchases.Purchases.Add(
+                                    new ShopObjectPurchaseEntry { SavableObjectID = sid, AmountPurchased = sp.Amount });
+                        }
+                    }
+
+                    // Sync contracts
+                    var contracts = Singleton<ContractsManager>.Instance;
+                    if (contracts != null)
+                        ApplyContractState(contracts, delta.World);
+                }
+                finally
+                {
+                    EconomyPatch.NetworkBypass = false;
+                    ResearchPatch.NetworkBypass = false;
+                }
+            }
+
+            // Update remote player visuals from host-sent positions
+            if (delta.PlayerUpdates != null)
+                RemotePlayerManager.UpdatePlayers(delta.PlayerUpdates, MultiplayerState.LocalPlayerId);
+
+            // Apply conveyor changes
+            if (delta.ChangedConveyors != null && delta.ChangedConveyors.Count > 0)
+                ApplyConveyorStates(delta.ChangedConveyors);
+
+            // Apply building removals
+            if (delta.RemovedBuildings != null)
+            {
+                foreach (var info in delta.RemovedBuildings)
+                    OnRemoteBuildingRemoved(info);
+            }
+
+            // Apply building state updates (custom save data)
+            if (delta.ChangedBuildings != null && delta.ChangedBuildings.Count > 0)
+                ApplyBuildingUpdates(delta.ChangedBuildings);
+        }
+
+        private void ApplyActiveQuestProgress(QuestManager quests, ActiveQuestData[] activeQuests)
+        {
+            foreach (var aq in activeQuests)
+            {
+                if (!System.Enum.TryParse<QuestID>(aq.QuestId, out var qid)) continue;
+                var quest = quests.GetQuestByID(qid);
+                if (quest == null) continue;
+
+                int ri = 0, ti = 0;
+                foreach (var req in quest.QuestRequirements)
+                {
+                    if (req is ResourceQuestRequirement rr && aq.ResourceProgress != null && ri < aq.ResourceProgress.Length)
+                    {
+                        rr.CurrentAmount = aq.ResourceProgress[ri].CurrentAmount;
+                        ri++;
+                    }
+                    else if (req is TriggeredQuestRequirement tr && aq.TriggeredProgress != null && ti < aq.TriggeredProgress.Length)
+                    {
+                        tr.CurrentAmount = aq.TriggeredProgress[ti].CurrentAmount;
+                        ti++;
+                    }
+                }
+            }
+        }
+
+        private void ApplyContractState(ContractsManager contracts, WorldState world)
+        {
+            QuestPatch.NetworkBypass = true;
+            try
+            {
+                // Match active contract by name and sync progress
+                if (world.ActiveContract != null)
+                {
+                    if (contracts.ActiveContract != null && contracts.ActiveContract.Name == world.ActiveContract.Name)
+                    {
+                        ApplyContractProgress(contracts.ActiveContract, world.ActiveContract);
+                    }
+                    else
+                    {
+                        // Find the matching contract in inactive list and activate it
+                        var match = contracts.InactiveContracts?.FirstOrDefault(c => c.Name == world.ActiveContract.Name);
+                        if (match != null)
+                        {
+                            contracts.SetContractActive(match);
+                            ApplyContractProgress(contracts.ActiveContract, world.ActiveContract);
+                        }
+                    }
+                }
+                else if (contracts.ActiveContract != null)
+                {
+                    // Host has no active contract but we do — deactivate
+                    contracts.SetContractInactive(contracts.ActiveContract);
+                }
+
+                // Sync inactive contract progress
+                if (world.InactiveContracts != null)
+                {
+                    foreach (var wc in world.InactiveContracts)
+                    {
+                        var local = contracts.InactiveContracts?.FirstOrDefault(c => c.Name == wc.Name);
+                        if (local != null)
+                            ApplyContractProgress(local, wc);
+                    }
+                }
+            }
+            finally { QuestPatch.NetworkBypass = false; }
+        }
+
+        private void ApplyContractProgress(ContractInstance contract, ContractData data)
+        {
+            if (data.Progress == null) return;
+            int ri = 0;
+            foreach (var req in contract.QuestRequirements)
+            {
+                if (req is ResourceQuestRequirement rr && ri < data.Progress.Length)
+                {
+                    rr.CurrentAmount = data.Progress[ri].CurrentAmount;
+                    ri++;
+                }
+            }
+        }
+
+        private void ApplyConveyorStates(List<ConveyorState> conveyors)
+        {
+            // Match belts by position + rotation (InstanceIDs differ across processes)
+            foreach (var cs in conveyors)
+            {
+                ConveyorBelt match = null;
+                float closest = 0.15f;
+                foreach (var belt in ConveyorBelt.AllConveyorBelts)
+                {
+                    if (belt == null) continue;
+                    float dist = Vector3.Distance(belt.transform.position, cs.Position.ToUnity());
+                    if (dist < closest)
+                    {
+                        // Also verify rotation is close (within 15 degrees)
+                        if (cs.Rotation.W != 0f && Quaternion.Angle(belt.transform.rotation, cs.Rotation.ToUnity()) > 15f)
+                            continue;
+                        closest = dist;
+                        match = belt;
+                    }
+                }
+                if (match != null)
+                {
+                    ConveyorPatch.NetworkBypass = true;
+                    try
+                    {
+                        if (match.Speed != cs.Speed)
+                            match.ChangeSpeed(cs.Speed);
+                        match.Disabled = cs.Disabled;
+                    }
+                    finally { ConveyorPatch.NetworkBypass = false; }
+                }
+            }
+        }
+
+        /// <summary>Match snapshot buildings against local buildings, queue missing for batched spawn, remove extras.</summary>
+        private void ReconcileBuildingsFromSnapshot(List<BuildingState> hostBuildings)
+        {
+            var localBuildings = new List<BuildingObject>(
+                UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None));
+
+            _log.LogInfo($"[Session] Building reconcile start: local={localBuildings.Count} host={hostBuildings?.Count ?? 0}");
+
+            // Build a spatial lookup: key = "Type|X|Y|Z" (rounded to 0.1) → list of local buildings
+            var localLookup = new Dictionary<string, List<BuildingObject>>();
+            foreach (var lb in localBuildings)
+            {
+                if (lb == null || lb.IsGhost) continue;
+                var key = BuildingSpatialKey(lb.SavableObjectID.ToString(), lb.transform.position);
+                if (!localLookup.TryGetValue(key, out var list))
+                {
+                    list = new List<BuildingObject>(1);
+                    localLookup[key] = list;
+                }
+                list.Add(lb);
+            }
+
+            var matched = new HashSet<int>();
+            int matchedWithDataCount = 0;
+            var toSpawn = new List<BuildingState>();
+
+            foreach (var hb in hostBuildings)
+            {
+                var key = BuildingSpatialKey(hb.SavableObjectId, hb.Position.ToUnity());
+                BuildingObject localMatch = null;
+
+                if (localLookup.TryGetValue(key, out var candidates))
+                {
+                    foreach (var lb in candidates)
+                    {
+                        if (matched.Contains(lb.GetInstanceID())) continue;
+                        if (Vector3.Distance(lb.transform.position, hb.Position.ToUnity()) < 0.15f)
+                        {
+                            localMatch = lb;
+                            matched.Add(lb.GetInstanceID());
+                            break;
+                        }
+                    }
+                }
+
+                if (localMatch != null)
+                {
+                    if (!string.IsNullOrEmpty(hb.CustomSaveData) && localMatch is ICustomSaveDataProvider provider)
+                    {
+                        provider.LoadFromSave(hb.CustomSaveData);
+                        matchedWithDataCount++;
+                    }
+                }
+                else
+                {
+                    toSpawn.Add(hb);
+                }
+            }
+
+            // Collect buildings to remove (not present in host snapshot)
+            var toRemove = new List<BuildingObject>();
+            foreach (var lb in localBuildings)
+            {
+                if (lb == null || lb.IsGhost) continue;
+                if (!matched.Contains(lb.GetInstanceID()))
+                    toRemove.Add(lb);
+            }
+
+            // Remove extras immediately (cheap: just Destroy calls)
+            BuildingPatch.NetworkBypass = true;
+            try
+            {
+                foreach (var lb in toRemove)
+                    UnityEngine.Object.Destroy(lb.gameObject);
+            }
+            finally { BuildingPatch.NetworkBypass = false; }
+
+            // Queue spawns for batched processing across multiple ticks
+            _pendingBuildingSpawns = new Queue<BuildingState>(toSpawn);
+
+            _log.LogInfo($"[Session] Building reconcile: matched={matched.Count} dataSync={matchedWithDataCount} " +
+                         $"queued={toSpawn.Count} removed={toRemove.Count} (batching {MaxBuildingSpawnsPerTick}/tick)");
+        }
+
+        /// <summary>Generate a spatial bucket key for building matching. Rounds to 0.1 units.</summary>
+        private static string BuildingSpatialKey(string savableId, Vector3 pos)
+        {
+            // Round to nearest 0.1 for bucket matching
+            int x = Mathf.RoundToInt(pos.x * 10);
+            int y = Mathf.RoundToInt(pos.y * 10);
+            int z = Mathf.RoundToInt(pos.z * 10);
+            return $"{savableId}|{x}|{y}|{z}";
+        }
+
+        /// <summary>Incrementally reconcile ores: keep matching, remove extras, spawn missing.</summary>
+        private void ReconcileOresFromSnapshot(List<OrePieceState> hostOres)
+        {
+            int removed = 0, spawned = 0, kept = 0;
+
+            // First, delete ALL local ores not tracked by network ID (e.g. ores
+            // auto-spawned by the game when the scene loaded, before any snapshot).
+            var trackedInstances = new HashSet<OrePiece>();
+            foreach (var kv in _clientOreByNetId)
+            {
+                if (kv.Value != null) trackedInstances.Add(kv.Value);
+            }
+            foreach (var ore in new List<OrePiece>(OrePiece.AllOrePieces))
+            {
+                if (ore != null && !trackedInstances.Contains(ore))
+                {
+                    ore.Delete();
+                    removed++;
+                }
+            }
+
+            if (hostOres == null || hostOres.Count == 0)
+            {
+                // Host has no ores — also clear tracked
+                foreach (var kv in _clientOreByNetId)
+                    if (kv.Value != null) kv.Value.Delete();
+                _clientOreByNetId.Clear();
+                _log.LogInfo($"[Session] Ore reconcile: removed all {removed} untracked + {_clientOreByNetId.Count} tracked (host has 0)");
+                return;
+            }
+
+            // Build set of host network IDs for quick lookup
+            var hostNetIds = new HashSet<int>();
+            foreach (var ho in hostOres)
+                hostNetIds.Add(ho.NetworkId);
+
+            // Remove client ores that the host no longer has
+            var toRemove = new List<int>();
+            foreach (var kv in _clientOreByNetId)
+            {
+                if (!hostNetIds.Contains(kv.Key))
+                {
+                    if (kv.Value != null) kv.Value.Delete();
+                    toRemove.Add(kv.Key);
+                    removed++;
+                }
+                else
+                {
+                    kept++;
+                }
+            }
+            foreach (var id in toRemove)
+                _clientOreByNetId.Remove(id);
+
+            // Spawn ores the host has that we don't
+            foreach (var ho in hostOres)
+            {
+                if (!_clientOreByNetId.ContainsKey(ho.NetworkId))
+                {
+                    OnRemoteOreSpawned(ho);
+                    spawned++;
+                }
+            }
+
+            _log.LogInfo($"[Session] Ore reconcile: kept={kept} removed={removed} spawned={spawned} (host total={hostOres.Count})");
+        }
+
+        /// <summary>Apply building custom save data updates from delta.</summary>
+        private void ApplyBuildingUpdates(List<BuildingState> buildings)
+        {
+            if (buildings.Count == 0) return;
+
+            // Build spatial lookup once instead of calling FindObjectsByType per building
+            var localLookup = new Dictionary<string, List<BuildingObject>>();
+            foreach (var bo in UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None))
+            {
+                if (bo == null || bo.IsGhost) continue;
+                var key = BuildingSpatialKey(bo.SavableObjectID.ToString(), bo.transform.position);
+                if (!localLookup.TryGetValue(key, out var list))
+                {
+                    list = new List<BuildingObject>(1);
+                    localLookup[key] = list;
+                }
+                list.Add(bo);
+            }
+
+            foreach (var state in buildings)
+            {
+                if (string.IsNullOrEmpty(state.CustomSaveData)) continue;
+                var key = BuildingSpatialKey(state.SavableObjectId, state.Position.ToUnity());
+                if (localLookup.TryGetValue(key, out var candidates))
+                {
+                    foreach (var bo in candidates)
+                    {
+                        if (Vector3.Distance(bo.transform.position, state.Position.ToUnity()) < 0.15f)
+                        {
+                            if (bo is ICustomSaveDataProvider provider)
+                                provider.LoadFromSave(state.CustomSaveData);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        private void CheckHash(WorldHash hash)
+        {
+            // Skip hash check while buildings are still being batched in — snapshot would be incomplete
+            if (_pendingBuildingSpawns != null && _pendingBuildingSpawns.Count > 0)
+            {
+                _log.LogInfo($"[Session] Hash check at tick {hash.Tick} — skipped ({_pendingBuildingSpawns.Count} buildings still spawning)");
+                return;
+            }
+
+            _log.LogInfo($"[Session] Hash check at tick {hash.Tick}");
+
+            try
+            {
+                // Build local snapshot and compare hash
+                var localSnapshot = BuildClientSnapshot();
+                var localHash = WorldHasher.ComputeHash(localSnapshot);
+
+                if (localHash != hash.Hash)
+                {
+                    _consecutiveDesyncCount++;
+                    // Log component-level details so we can pinpoint what diverged
+                    var details = WorldHasher.DiagnoseComponents(localSnapshot);
+                    _log.LogWarning($"[Session] Hash mismatch #{_consecutiveDesyncCount} at tick {hash.Tick}. Local={localHash} Host={hash.Hash}  Components: {details}");
+
+                    if (_consecutiveDesyncCount >= ConsecutiveDesyncThreshold)
+                    {
+                        _log.LogWarning($"[Session] DESYNC confirmed after {_consecutiveDesyncCount} consecutive mismatches. Requesting resync.");
+                        LogEvent("Desync detected — requesting resync from host.");
+                        _net?.SendToHost(MessageType.ResyncRequest, hash.Tick);
+                        _consecutiveDesyncCount = 0;
+                    }
+                }
+                else
+                {
+                    if (_consecutiveDesyncCount > 0)
+                        _log.LogInfo($"[Session] Hash matched after {_consecutiveDesyncCount} prior mismatch(es) — transient desync resolved.");
+                    _consecutiveDesyncCount = 0;
+                }
+            }
+            catch (System.Exception ex)
+            {
+                _log.LogError($"[Session] Hash check failed at tick {hash.Tick}: {ex}");
+            }
+        }
+
+        /// <summary>Build a client-side snapshot for hash verification.</summary>
+        private WorldSnapshot BuildClientSnapshot()
+        {
+            var eco = Singleton<EconomyManager>.Instance;
+            var research = Singleton<ResearchManager>.Instance;
+            var quests = Singleton<QuestManager>.Instance;
+            var contracts = Singleton<ContractsManager>.Instance;
+
+            var worldState = BuildWorldState(eco, research, quests, contracts);
+
+            var buildings = new List<BuildingState>();
+            foreach (var bo in UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None))
+            {
+                if (bo == null || bo.IsGhost) continue;
+                buildings.Add(new BuildingState
+                {
+                    LocalInstanceId = 0, // Not used for cross-process hash
+                    SavableObjectId = bo.SavableObjectID.ToString(),
+                    Position = new NetVector3(bo.transform.position),
+                    Rotation = new NetQuaternion(bo.transform.rotation)
+                });
+            }
+
+            var orePieces = new List<OrePieceState>();
+            foreach (var ore in OrePiece.AllOrePieces)
+            {
+                if (ore == null) continue;
+                orePieces.Add(new OrePieceState
+                {
+                    NetworkId = 0, // Not used for hash
+                    ResourceType = (NetResourceType)(int)ore.ResourceType,
+                    PieceType = (NetPieceType)(int)ore.PieceType,
+                    IsPolished = ore.IsPolished,
+                    Position = new NetVector3(ore.transform.position)
+                });
+            }
+
+            return new WorldSnapshot
+            {
+                World = worldState,
+                Buildings = buildings,
+                OrePieces = orePieces,
+                Conveyors = BuildClientConveyorStates(),
+                Tick = _tick
+            };
+        }
+
+        /// <summary>Build conveyor states for client hash verification using FindObjectsByType for reliability.</summary>
+        private List<ConveyorState> BuildClientConveyorStates()
+        {
+            var result = new List<ConveyorState>();
+            foreach (var belt in UnityEngine.Object.FindObjectsByType<ConveyorBelt>(FindObjectsSortMode.None))
+            {
+                if (belt == null) continue;
+                result.Add(new ConveyorState
+                {
+                    LocalInstanceId = belt.GetInstanceID(),
+                    Speed = belt.Speed,
+                    Disabled = belt.Disabled,
+                    Position = new NetVector3(belt.transform.position),
+                    Rotation = new NetQuaternion(belt.transform.rotation)
+                });
+            }
+            return result;
+        }
+
+        private void OnRemoteBuildingSpawned(BuildingState building)
+        {
+            if (!System.Enum.TryParse<SavableObjectID>(building.SavableObjectId, out var savableId))
+            {
+                _log.LogWarning($"[Session] Unknown SavableObjectID: {building.SavableObjectId}");
+                return;
+            }
+
+            var slm = Singleton<SavingLoadingManager>.Instance;
+            if (slm == null) return;
+
+            var prefab = slm.GetPrefab(savableId);
+            if (prefab == null) return;
+
+            BuildingPatch.NetworkBypass = true;
+            try
+            {
+                var go = UnityEngine.Object.Instantiate(prefab, building.Position.ToUnity(), building.Rotation.ToUnity());
+                // Apply custom save data if present
+                if (!string.IsNullOrEmpty(building.CustomSaveData))
+                {
+                    var customProvider = go.GetComponentInChildren<ICustomSaveDataProvider>();
+                    if (customProvider != null)
+                        customProvider.LoadFromSave(building.CustomSaveData);
+                }
+            }
+            finally { BuildingPatch.NetworkBypass = false; }
+        }
+
+        /// <summary>Process queued building spawns from ReconcileBuildingsFromSnapshot (max N per tick).</summary>
+        private void ProcessPendingBuildingSpawns()
+        {
+            if (_pendingBuildingSpawns == null || _pendingBuildingSpawns.Count == 0) return;
+
+            int count = 0;
+            BuildingPatch.NetworkBypass = true;
+            try
+            {
+                while (_pendingBuildingSpawns.Count > 0 && count < MaxBuildingSpawnsPerTick)
+                {
+                    var building = _pendingBuildingSpawns.Dequeue();
+                    OnRemoteBuildingSpawned(building);
+                    count++;
+                }
+            }
+            finally { BuildingPatch.NetworkBypass = false; }
+
+            if (_pendingBuildingSpawns.Count > 0)
+                _log.LogInfo($"[Session] Batched building spawn: {count} this tick, {_pendingBuildingSpawns.Count} remaining");
+            else
+                _log.LogInfo($"[Session] Batched building spawn complete: {count} final batch");
+        }
+
+        private void OnRemoteBuildingRemoved(BuildingRemovalInfo info)
+        {
+            _log.LogInfo($"[Session] Remote building removed: {info.SavableObjectId} at {info.Position}");
+            foreach (var bo in UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None))
+            {
+                if (bo.SavableObjectID.ToString() == info.SavableObjectId &&
+                    Vector3.Distance(bo.transform.position, info.Position.ToUnity()) < 0.15f)
+                {
+                    UnityEngine.Object.Destroy(bo.gameObject);
+                    break;
+                }
+            }
+        }
+
+        private void OnRemoteOreSpawned(OrePieceState ore)
+        {
+
+            var poolMgr = Singleton<OrePiecePoolManager>.Instance;
+            if (poolMgr == null) return;
+
+            var resourceType = (ResourceType)(int)ore.ResourceType;
+            var pieceType = (PieceType)(int)ore.PieceType;
+            var pos = ore.Position.ToUnity();
+            var rot = ore.Rotation.ToUnity();
+
+            var spawned = poolMgr.SpawnPooledOre(resourceType, pieceType, ore.IsPolished, pos, rot, null);
+            if (spawned != null)
+            {
+                var rb = spawned.GetComponent<Rigidbody>();
+                if (rb != null)
+                    rb.linearVelocity = ore.Velocity.ToUnity();
+
+                // Track by network ID for later removal
+                _clientOreByNetId[ore.NetworkId] = spawned;
+            }
+        }
+
+        private void OnRemoteOreRemoved(int networkId)
+        {
+            if (_clientOreByNetId.TryGetValue(networkId, out var ore))
+            {
+                if (ore != null) ore.Delete();
+                _clientOreByNetId.Remove(networkId);
+            }
+        }
+
+        /// <summary>Apply ore position updates from host — smoothly moves ore pieces that have changed position.</summary>
+        private void ApplyOrePositionUpdates(List<OrePositionUpdate> updates)
+        {
+            if (updates == null) return;
+            foreach (var upd in updates)
+            {
+                // Skip ores the client is actively holding — don't let host override local grab
+                if (_clientLocallyHeldOres.Contains(upd.NetworkId)) continue;
+
+                if (_clientOreByNetId.TryGetValue(upd.NetworkId, out var ore) && ore != null)
+                {
+                    ore.transform.position = upd.Position.ToUnity();
+                    ore.transform.rotation = upd.Rotation.ToUnity();
+                    var rb = ore.GetComponent<Rigidbody>();
+                    if (rb != null)
+                    {
+                        rb.isKinematic = true;
+                        rb.linearVelocity = Vector3.zero;
+                        rb.angularVelocity = Vector3.zero;
+                    }
+                    _remotelyHeldOres[upd.NetworkId] = UnityEngine.Time.unscaledTime;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reconcile the local PlayerInventory with the authoritative tool list from the host.
+        /// Adds any missing tools and removes extras so both players share the same set.
+        /// </summary>
+        private void ReconcileToolInventory(string[] hostTools)
+        {
+            if (hostTools == null) return;
+
+            if (_cachedPlayerController == null)
+                _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
+            if (_cachedPlayerController == null) return;
+
+            var inv = _cachedPlayerController.GetComponent<PlayerInventory>();
+            if (inv == null) return;
+
+            var slm = Singleton<SavingLoadingManager>.Instance;
+            if (slm == null) return;
+
+            // Build a count map of host tools
+            var hostToolCounts = new Dictionary<string, int>();
+            foreach (var t in hostTools)
+            {
+                if (string.IsNullOrEmpty(t)) continue;
+                // ToolBuilder cannot be instantiated on clients (GetIcon NRE)
+                if (t == "ToolBuilder") continue;
+                if (!hostToolCounts.ContainsKey(t))
+                    hostToolCounts[t] = 0;
+                hostToolCounts[t]++;
+            }
+
+            // Build a count map of local tools
+            var localToolCounts = new Dictionary<string, int>();
+            foreach (var tool in inv.Items)
+            {
+                if (tool == null) continue;
+                var name = tool.SavableObjectID.ToString();
+                if (!localToolCounts.ContainsKey(name))
+                    localToolCounts[name] = 0;
+                localToolCounts[name]++;
+            }
+
+            // Add missing tools
+            foreach (var kv in hostToolCounts)
+            {
+                localToolCounts.TryGetValue(kv.Key, out int localCount);
+                int toAdd = kv.Value - localCount;
+                if (toAdd <= 0) continue;
+
+                if (!System.Enum.TryParse<SavableObjectID>(kv.Key, out var savableId))
+                    continue;
+                var prefab = slm.GetPrefab(savableId);
+                if (prefab == null) continue;
+
+                for (int i = 0; i < toAdd; i++)
+                {
+                    var go = UnityEngine.Object.Instantiate(prefab, Vector3.zero, Quaternion.identity);
+                    var tool = go.GetComponent<BaseHeldTool>();
+                    if (tool != null)
+                    {
+                        try
+                        {
+                            inv.TryAddToInventory(tool);
+                            _log.LogInfo($"[Session] Added tool '{kv.Key}' to inventory (shared sync)");
+                        }
+                        catch (System.Exception ex)
+                        {
+                            _log.LogWarning($"[Session] TryAddToInventory for '{kv.Key}' threw (icon init): {ex.GetType().Name}");
+                            // Remove broken tool to prevent PlayerInventory.Update()->UpdateUI()->GetIcon() crash every frame
+                            try { inv.Items.Remove(tool); } catch { }
+                            UnityEngine.Object.Destroy(go);
+                        }
+                    }
+                    else
+                    {
+                        UnityEngine.Object.Destroy(go);
+                    }
+                }
+            }
+        }
+
+        // ── Snapshot / delta builders ────────────────
+
+        private WorldSnapshot BuildSnapshot()
+        {
+            var eco = Singleton<EconomyManager>.Instance;
+            var research = Singleton<ResearchManager>.Instance;
+            var quests = Singleton<QuestManager>.Instance;
+            var contracts = Singleton<ContractsManager>.Instance;
+
+            var worldState = BuildWorldState(eco, research, quests, contracts);
+
+            // Collect all buildings
+            var buildings = new List<BuildingState>();
+            foreach (var bo in UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None))
+            {
+                if (bo.IsGhost) continue;
+                var state = new BuildingState
+                {
+                    LocalInstanceId = bo.GetInstanceID(),
+                    SavableObjectId = bo.SavableObjectID.ToString(),
+                    Position = new NetVector3(bo.transform.position),
+                    Rotation = new NetQuaternion(bo.transform.rotation)
+                };
+                if (bo is ICustomSaveDataProvider provider)
+                    state.CustomSaveData = provider.GetCustomSaveData();
+                buildings.Add(state);
+            }
+
+            // Collect all ore pieces — assign/use network IDs
+            var orePieces = new List<OrePieceState>();
+            foreach (var ore in OrePiece.AllOrePieces)
+            {
+                if (ore == null) continue;
+                int localId = ore.GetInstanceID();
+
+                // Ensure every ore has a network ID (snapshot might be called before DetectOreChanges)
+                if (!_hostOreInstanceToNetId.TryGetValue(localId, out int netId))
+                {
+                    netId = _nextOreNetId++;
+                    _hostOreInstanceToNetId[localId] = netId;
+                }
+
+                var rb = ore.GetComponent<Rigidbody>();
+                orePieces.Add(new OrePieceState
+                {
+                    NetworkId = netId,
+                    ResourceType = (NetResourceType)(int)ore.ResourceType,
+                    PieceType = (NetPieceType)(int)ore.PieceType,
+                    IsPolished = ore.IsPolished,
+                    Position = new NetVector3(ore.transform.position),
+                    Rotation = new NetQuaternion(ore.transform.rotation),
+                    Velocity = rb != null ? new NetVector3(rb.linearVelocity) : default,
+                    SellValue = ore.GetSellValue()
+                });
+            }
+
+            return new WorldSnapshot
+            {
+                World = worldState,
+                Players = new List<PlayerState>(_players),
+                Buildings = buildings,
+                OrePieces = orePieces,
+                Conveyors = BuildConveyorStates(),
+                Tick = _tick,
+                Crates = BuildCrateStates()
+            };
+        }
+
+        private WorldDelta BuildDelta(HashSet<int> dirtyMachines, HashSet<int> dirtyBelts,
+            List<BuildingRemovalInfo> removedBuildings, bool moneyDirty, bool researchDirty, bool questDirty,
+            bool contractDirty, bool shopPurchaseDirty, bool activeQuestProgressDirty)
+        {
+            bool anythingDirty = moneyDirty ||
+                                 researchDirty ||
+                                 questDirty ||
+                                 contractDirty ||
+                                 shopPurchaseDirty ||
+                                 activeQuestProgressDirty ||
+                                 dirtyMachines.Count > 0 ||
+                                 removedBuildings.Count > 0 ||
+                                 dirtyBelts.Count > 0;
+
+            // Always send player positions when there are multiple players
+            if (!anythingDirty && _players.Count <= 1)
+                return null;
+
+            bool worldDirty = moneyDirty || researchDirty || questDirty ||
+                              contractDirty || shopPurchaseDirty || activeQuestProgressDirty;
+
+            var eco = Singleton<EconomyManager>.Instance;
+            var research = Singleton<ResearchManager>.Instance;
+            var quests = Singleton<QuestManager>.Instance;
+            var contracts = Singleton<ContractsManager>.Instance;
+
+            return new WorldDelta
+            {
+                Tick = _tick,
+                ChangedBuildings = BuildDirtyBuildings(dirtyMachines),
+                RemovedBuildings = removedBuildings,
+                ChangedOrePieces = new List<OrePieceState>(),
+                RemovedOrePieceIds = new List<int>(),
+                PlayerUpdates = new List<PlayerState>(_players),
+                World = worldDirty ? BuildWorldState(eco, research, quests, contracts) : null,
+                ChangedConveyors = BuildDirtyConveyors(dirtyBelts)
+            };
+        }
+
+        private WorldState BuildWorldState(EconomyManager eco, ResearchManager research, QuestManager quests, ContractsManager contracts)
+        {
+            var state = new WorldState
+            {
+                Money = eco != null ? eco.Money : 0,
+                ResearchTickets = research != null ? research.ResearchTickets : 0,
+                CompletedResearchIds = research?.CompletedResearchItems?
+                    .Select(id => id.ToString()).ToArray() ?? Array.Empty<string>(),
+                CompletedQuestIds = quests?.GetCompletedQuestIDs()?
+                    .Select(id => id.ToString()).ToArray() ?? Array.Empty<string>()
+            };
+
+            // Active quest progress
+            if (quests != null)
+            {
+                var activeQuests = new List<ActiveQuestData>();
+                foreach (var quest in quests.ActiveQuests)
+                {
+                    var rProgress = new List<ResourceRequirementProgress>();
+                    var tProgress = new List<TriggeredRequirementProgress>();
+                    foreach (var req in quest.QuestRequirements)
+                    {
+                        if (req is ResourceQuestRequirement rr)
+                            rProgress.Add(new ResourceRequirementProgress
+                            {
+                                ResourceType = rr.ResourceType.ToString(),
+                                PieceType = rr.PieceType.ToString(),
+                                RequirePolished = rr.RequirePolishedResource,
+                                CurrentAmount = rr.CurrentAmount
+                            });
+                        else if (req is TriggeredQuestRequirement tr)
+                            tProgress.Add(new TriggeredRequirementProgress
+                            {
+                                Type = tr.TriggeredQuestRequirementType.ToString(),
+                                CurrentAmount = tr.CurrentAmount
+                            });
+                    }
+                    activeQuests.Add(new ActiveQuestData
+                    {
+                        QuestId = quest.QuestID.ToString(),
+                        ResourceProgress = rProgress.ToArray(),
+                        TriggeredProgress = tProgress.ToArray()
+                    });
+                }
+                state.ActiveQuests = activeQuests.ToArray();
+            }
+
+            // Shop purchases
+            if (eco?.ShopPurchases != null)
+            {
+                state.ShopPurchases = eco.ShopPurchases.Purchases?
+                    .Select(p => new ShopPurchaseData
+                    {
+                        SavableObjectId = p.SavableObjectID.ToString(),
+                        Amount = p.AmountPurchased
+                    }).ToArray() ?? Array.Empty<ShopPurchaseData>();
+            }
+
+            // Contracts
+            if (contracts != null)
+            {
+                if (contracts.ActiveContract != null)
+                    state.ActiveContract = BuildContractData(contracts.ActiveContract);
+                if (contracts.InactiveContracts != null)
+                    state.InactiveContracts = contracts.InactiveContracts
+                        .Select(c => BuildContractData(c)).ToArray();
+            }
+
+            return state;
+        }
+
+        private ContractData BuildContractData(ContractInstance contract)
+        {
+            var progress = new List<ResourceRequirementProgress>();
+            foreach (var req in contract.QuestRequirements)
+            {
+                if (req is ResourceQuestRequirement rr)
+                    progress.Add(new ResourceRequirementProgress
+                    {
+                        ResourceType = rr.ResourceType.ToString(),
+                        PieceType = rr.PieceType.ToString(),
+                        RequirePolished = rr.RequirePolishedResource,
+                        CurrentAmount = rr.CurrentAmount
+                    });
+            }
+            return new ContractData
+            {
+                Name = contract.Name,
+                Progress = progress.ToArray(),
+                RewardMoney = contract.RewardMoney
+            };
+        }
+
+        private List<BuildingState> BuildDirtyBuildings(HashSet<int> dirtyMachines)
+        {
+            var result = new List<BuildingState>();
+            if (dirtyMachines.Count == 0) return result;
+
+            // Use per-tick cached building lookup instead of FindObjectsByType every call
+            if (_cachedBuildingLookup == null)
+            {
+                var allBuildings = UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None);
+                _cachedBuildingLookup = new Dictionary<int, BuildingObject>(allBuildings.Length);
+                foreach (var bo in allBuildings)
+                    if (bo != null && !bo.IsGhost) _cachedBuildingLookup[bo.GetInstanceID()] = bo;
+            }
+
+            foreach (var instanceId in dirtyMachines)
+            {
+                if (!_cachedBuildingLookup.TryGetValue(instanceId, out var bo)) continue;
+
+                var state = new BuildingState
+                {
+                    LocalInstanceId = bo.GetInstanceID(),
+                    SavableObjectId = bo.SavableObjectID.ToString(),
+                    Position = new NetVector3(bo.transform.position),
+                    Rotation = new NetQuaternion(bo.transform.rotation)
+                };
+                if (bo is ICustomSaveDataProvider provider)
+                    state.CustomSaveData = provider.GetCustomSaveData();
+                result.Add(state);
+            }
+            return result;
+        }
+
+        private List<ConveyorState> BuildConveyorStates()
+        {
+            var result = new List<ConveyorState>();
+            foreach (var belt in ConveyorBelt.AllConveyorBelts)
+            {
+                if (belt == null) continue;
+                result.Add(new ConveyorState
+                {
+                    LocalInstanceId = belt.GetInstanceID(),
+                    Speed = belt.Speed,
+                    Disabled = belt.Disabled,
+                    Position = new NetVector3(belt.transform.position),
+                    Rotation = new NetQuaternion(belt.transform.rotation)
+                });
+            }
+            return result;
+        }
+
+        private List<CrateState> BuildCrateStates()
+        {
+            var result = new List<CrateState>();
+            foreach (var crate in UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None))
+            {
+                if (crate == null) continue;
+                int instanceId = crate.GetInstanceID();
+                if (!_hostCrateInstanceToNetId.TryGetValue(instanceId, out int netId))
+                {
+                    netId = _nextCrateNetId++;
+                    _hostCrateInstanceToNetId[instanceId] = netId;
+                }
+                result.Add(new CrateState
+                {
+                    NetworkId = netId,
+                    Position = new NetVector3(crate.transform.position),
+                    Rotation = new NetQuaternion(crate.transform.rotation)
+                });
+            }
+            return result;
+        }
+
+        private List<ConveyorState> BuildDirtyConveyors(HashSet<int> dirtyBelts)
+        {
+            var result = new List<ConveyorState>();
+            if (dirtyBelts.Count == 0) return result;
+
+            foreach (var belt in ConveyorBelt.AllConveyorBelts)
+            {
+                if (belt == null) continue;
+                if (!dirtyBelts.Contains(belt.GetInstanceID())) continue;
+                result.Add(new ConveyorState
+                {
+                    LocalInstanceId = belt.GetInstanceID(),
+                    Speed = belt.Speed,
+                    Disabled = belt.Disabled,
+                    Position = new NetVector3(belt.transform.position),
+                    Rotation = new NetQuaternion(belt.transform.rotation)
+                });
+            }
+            return result;
+        }
+
+        // ── Client RPC helpers (called from patches) ─
+
+        public void SendPlaceBuildingRPC(string savableObjectId, NetVector3 position, NetQuaternion rotation)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.PlaceBuilding, new PlaceBuildingMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                SavableObjectId = savableObjectId,
+                Position = position,
+                Rotation = rotation
+            });
+        }
+
+        public void SendRemoveBuildingRPC(NetVector3 position, string savableObjectId)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.RemoveBuilding, new RemoveBuildingMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                Position = position,
+                SavableObjectId = savableObjectId
+            });
+        }
+
+        public void SendInteractBuildingRPC(int buildingInstanceId, string action)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.InteractBuilding, new InteractBuildingMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                BuildingInstanceId = buildingInstanceId,
+                Action = action
+            });
+        }
+
+        public void SendInteractBuildingByPosRPC(NetVector3 position, string action, string data = null)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.InteractBuilding, new InteractBuildingMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                Position = position,
+                Action = action,
+                Data = data
+            });
+        }
+
+        /// <summary>Client: notify the host that we purchased tools from the shop so the host can add them too.</summary>
+        public void NotifyHostOfPurchase(string[] purchasedTools, float totalCost)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.ShopPurchaseNotify, new ShopPurchaseNotifyMessage
+            {
+                PurchasedTools = purchasedTools,
+                TotalCost = totalCost
+            });
+            _log.LogInfo($"[Session] Sent shop purchase notification: {purchasedTools.Length} tools, cost={totalCost}");
+        }
+
+        /// <summary>Host: handle a client purchase notification — deduct shared money only (inventories are independent).</summary>
+        private void HandleShopPurchaseNotify(uint clientId, ShopPurchaseNotifyMessage msg)
+        {
+            _log.LogInfo($"[Session] Client {clientId} spent {msg.TotalCost} at the shop");
+
+            // Deduct money on the host (money is shared, inventory is not)
+            var eco = Singleton<EconomyManager>.Instance;
+            if (eco != null && msg.TotalCost > 0)
+            {
+                EconomyPatch.NetworkBypass = true;
+                try { eco.AddMoney(-msg.TotalCost); }
+                finally { EconomyPatch.NetworkBypass = false; }
+                DirtyTracker.MoneyDirty = true;
+            }
+        }
+
+        /// <summary>Host broadcasts a newly placed building to all clients.</summary>
+        public void BroadcastBuildingSpawned(BuildingState state)
+        {
+            if (!MultiplayerState.IsHost || _net == null) return;
+            _net.SendToAll(MessageType.BuildingSpawned, state);
+        }
+
+        public void SendMineNodeRPC(NetVector3 nodePos, float damage, NetVector3 hitPos)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.MineNode, new MineNodeMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                NodePosition = nodePos,
+                Damage = damage,
+                HitPosition = hitPos
+            });
+        }
+
+        /// <summary>Host broadcasts a mining damage event to all clients so they see node damage/break.</summary>
+        public void BroadcastMineNode(NetVector3 nodePos, float damage, NetVector3 hitPos)
+        {
+            if (!MultiplayerState.IsHost || _net == null) return;
+            _net.SendToAll(MessageType.MineNode, new MineNodeMessage
+            {
+                PlayerId = 0,
+                NodePosition = nodePos,
+                Damage = damage,
+                HitPosition = hitPos
+            });
+        }
+
+        /// <summary>Client applies a remote mining event: finds closest node and deals damage locally.</summary>
+        private void ApplyRemoteMining(MineNodeMessage msg)
+        {
+            OreNode closest = null;
+            float closestDist = float.MaxValue;
+            foreach (var node in UnityEngine.Object.FindObjectsByType<OreNode>(FindObjectsSortMode.None))
+            {
+                float dist = Vector3.Distance(node.transform.position, msg.NodePosition.ToUnity());
+                if (dist < closestDist)
+                {
+                    closestDist = dist;
+                    closest = node;
+                }
+            }
+            if (closest != null && closestDist < 1f)
+            {
+                // Count ores before so we can destroy any that spawn locally (host sends the real ones)
+                int oreCountBefore = OrePiece.AllOrePieces?.Count ?? 0;
+
+                MiningPatch.NetworkBypass = true;
+                MiningPatch.SuppressOreSpawn = true;
+                try { closest.TakeDamage(msg.Damage, msg.HitPosition.ToUnity()); }
+                finally
+                {
+                    MiningPatch.NetworkBypass = false;
+                    MiningPatch.SuppressOreSpawn = false;
+                }
+
+                // Destroy any ore pieces that were spawned locally (host will send the authoritative ones)
+                var allOres = OrePiece.AllOrePieces;
+                if (allOres != null && allOres.Count > oreCountBefore)
+                {
+                    for (int i = allOres.Count - 1; i >= oreCountBefore; i--)
+                    {
+                        var ore = allOres[i];
+                        if (ore != null)
+                        {
+                            try { ore.Delete(); }
+                            catch { UnityEngine.Object.Destroy(ore.gameObject); }
+                        }
+                    }
+                }
+            }
+        }
+
+        public void SendCrateDamageRPC(NetVector3 cratePos, float damage, NetVector3 hitPos)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.CrateDamage, new CrateDamageMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                CratePosition = cratePos,
+                Damage = damage,
+                HitPosition = hitPos
+            });
+        }
+
+        /// <summary>Host broadcasts a crate damage event to all clients.</summary>
+        public void BroadcastCrateDamage(NetVector3 cratePos, float damage, NetVector3 hitPos)
+        {
+            if (!MultiplayerState.IsHost || _net == null) return;
+            _net.SendToAll(MessageType.CrateDamage, new CrateDamageMessage
+            {
+                PlayerId = 0,
+                CratePosition = cratePos,
+                Damage = damage,
+                HitPosition = hitPos
+            });
+        }
+
+        /// <summary>Client applies a remote crate damage event.</summary>
+        private void ApplyRemoteCrateDamage(CrateDamageMessage msg)
+        {
+            _log.LogInfo($"[Session] Applying remote crate damage at {msg.CratePosition}, dmg={msg.Damage}");
+            BreakableCrate closest = null;
+            float closestDist = float.MaxValue;
+            foreach (var crate in UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None))
+            {
+                float dist = Vector3.Distance(crate.transform.position, msg.CratePosition.ToUnity());
+                if (dist < closestDist)
+                {
+                    closestDist = dist;
+                    closest = crate;
+                }
+            }
+            if (closest != null && closestDist < 2f)
+            {
+                // Count ores before — crate may spawn ores when breaking,
+                // but host sends the authoritative ones via OreSpawnedBatch
+                int oreCountBefore = OrePiece.AllOrePieces?.Count ?? 0;
+
+                Patches.MachineProcessingPatch.CrateNetworkBypass = true;
+                try { closest.TakeDamage(msg.Damage, msg.HitPosition.ToUnity()); }
+                finally { Patches.MachineProcessingPatch.CrateNetworkBypass = false; }
+
+                // Destroy any ore pieces that were spawned locally (host will send the real ones)
+                var allOres = OrePiece.AllOrePieces;
+                if (allOres != null && allOres.Count > oreCountBefore)
+                {
+                    for (int i = allOres.Count - 1; i >= oreCountBefore; i--)
+                    {
+                        var ore = allOres[i];
+                        if (ore != null)
+                        {
+                            try { ore.Delete(); }
+                            catch { UnityEngine.Object.Destroy(ore.gameObject); }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>Client: match host crate network IDs to local BreakableCrate objects and apply positions.</summary>
+        private void ReconcileCratesFromSnapshot(List<CrateState> hostCrates)
+        {
+            _clientCrateByNetId.Clear();
+
+            // Collect all local crates
+            var localCrates = new List<BreakableCrate>(
+                UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None));
+
+            // For each host crate, find the closest local crate and assign the network ID
+            var claimed = new HashSet<int>(); // local instanceIds already matched
+            foreach (var hc in hostCrates)
+            {
+                BreakableCrate best = null;
+                float bestDist = float.MaxValue;
+                foreach (var lc in localCrates)
+                {
+                    if (lc == null || claimed.Contains(lc.GetInstanceID())) continue;
+                    float dist = Vector3.Distance(lc.transform.position, hc.Position.ToUnity());
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        best = lc;
+                    }
+                }
+                if (best != null)
+                {
+                    claimed.Add(best.GetInstanceID());
+                    _clientCrateByNetId[hc.NetworkId] = best;
+                    // Snap crate to host position
+                    best.transform.position = hc.Position.ToUnity();
+                    best.transform.rotation = hc.Rotation.ToUnity();
+                    var rb = best.GetComponent<Rigidbody>();
+                    if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
+                }
+            }
+            _log.LogInfo($"[Session] Reconciled {_clientCrateByNetId.Count} crates from snapshot");
+        }
+
+        /// <summary>Host: check all tracked crates for position changes and send batched updates.</summary>
+        private void SendCratePositionUpdates()
+        {
+            _poolCratePositionUpdates.Clear();
+
+            // Single scene scan — build instanceId → crate lookup
+            var allCrates = UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None);
+            var crateById = new Dictionary<int, BreakableCrate>(allCrates.Length);
+            foreach (var crate in allCrates)
+            {
+                if (crate == null) continue;
+                int instanceId = crate.GetInstanceID();
+                crateById[instanceId] = crate;
+                // Ensure newly-spawned crates get a network ID
+                if (!_hostCrateInstanceToNetId.ContainsKey(instanceId))
+                    _hostCrateInstanceToNetId[instanceId] = _nextCrateNetId++;
+            }
+
+            // Check for moved crates using the lookup
+            foreach (var kv in _hostCrateInstanceToNetId)
+            {
+                if (!crateById.TryGetValue(kv.Key, out var found)) continue;
+
+                var pos = found.transform.position;
+                int netId = kv.Value;
+                if (_lastSentCratePositions.TryGetValue(netId, out var lastPos))
+                {
+                    if (Vector3.SqrMagnitude(pos - lastPos) < OrePositionMoveThreshold * OrePositionMoveThreshold)
+                        continue;
+                }
+
+                _lastSentCratePositions[netId] = pos;
+                _poolCratePositionUpdates.Add(new CratePositionUpdate
+                {
+                    NetworkId = netId,
+                    Position = new NetVector3(pos),
+                    Rotation = new NetQuaternion(found.transform.rotation)
+                });
+            }
+
+            if (_poolCratePositionUpdates.Count > 0)
+                _net.SendToAll(MessageType.CratePositionBatch, _poolCratePositionUpdates);
+        }
+
+        /// <summary>Client: apply crate position updates from host.</summary>
+        private void ApplyCratePositionUpdates(List<CratePositionUpdate> updates)
+        {
+            if (updates == null) return;
+            foreach (var upd in updates)
+            {
+                if (_clientCrateByNetId.TryGetValue(upd.NetworkId, out var crate) && crate != null)
+                {
+                    crate.transform.position = upd.Position.ToUnity();
+                    crate.transform.rotation = upd.Rotation.ToUnity();
+                    var rb = crate.GetComponent<Rigidbody>();
+                    if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
+                }
+            }
+        }
+
+        /// <summary>Host: apply client-sent crate positions (client is grabbing/moving a crate).</summary>
+        private void ApplyClientCratePositions(List<CratePositionUpdate> updates)
+        {
+            if (updates == null || updates.Count == 0) return;
+
+            // Build a reverse lookup: netId → instanceId
+            Dictionary<int, int> netIdToInstance = null;
+            foreach (var upd in updates)
+            {
+                // Lazy-build reverse lookup on first iteration
+                if (netIdToInstance == null)
+                {
+                    netIdToInstance = new Dictionary<int, int>(_hostCrateInstanceToNetId.Count);
+                    foreach (var kv in _hostCrateInstanceToNetId)
+                        netIdToInstance[kv.Value] = kv.Key;
+                }
+                if (!netIdToInstance.TryGetValue(upd.NetworkId, out int instanceId)) continue;
+
+                // Single scene scan (cached for the batch)
+                if (_cachedCrateLookup == null)
+                {
+                    var allCrates = UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None);
+                    _cachedCrateLookup = new Dictionary<int, BreakableCrate>(allCrates.Length);
+                    foreach (var c in allCrates)
+                        if (c != null) _cachedCrateLookup[c.GetInstanceID()] = c;
+                }
+
+                if (!_cachedCrateLookup.TryGetValue(instanceId, out var found)) continue;
+                found.transform.position = upd.Position.ToUnity();
+                found.transform.rotation = upd.Rotation.ToUnity();
+                var rb = found.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.isKinematic = true;
+                    rb.linearVelocity = Vector3.zero;
+                    rb.angularVelocity = Vector3.zero;
+                }
+            }
+        }
+
+        public void SendResearchRPC(string researchItemId)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.ResearchItem, new ResearchItemMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                ResearchItemId = researchItemId
+            });
+        }
+
+        // ── Debug / diagnostics ───────────────────────
+
+        /// <summary>Current tick counter.</summary>
+        public long CurrentTick => _tick;
+
+        /// <summary>Number of connected players (including host).</summary>
+        public int PlayerCount => _players.Count;
+
+        /// <summary>Get a diagnostic summary string for the debug overlay.</summary>
+        public string GetDebugInfo()
+        {
+            var role = MultiplayerState.CurrentRole.ToString();
+            var phase = Phase.ToString();
+            var players = _players.Count;
+            var net = _net != null && _net.IsRunning ? "UP" : "DOWN";
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"Role: {role}  |  Phase: {phase}  |  Net: {net}");
+            sb.AppendLine($"Tick: {_tick}  |  Players: {players}");
+
+            if (MultiplayerState.IsHost)
+            {
+                var oreCount = OrePiece.AllOrePieces?.Count ?? 0;
+                var buildingCount = 0;
+                foreach (var bo in UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None))
+                    if (bo != null && !bo.IsGhost) buildingCount++;
+                var eco = Singleton<EconomyManager>.Instance;
+                sb.AppendLine($"Buildings: {buildingCount}  |  Ores: {oreCount}  |  OreNetIds: {_hostOreInstanceToNetId.Count}");
+                sb.AppendLine($"Money: {(eco != null ? eco.Money.ToString("N0") : "?")}  |  Desyncs: {_consecutiveDesyncCount}");
+
+                foreach (var p in _players)
+                    sb.AppendLine($"  P{p.PlayerId}: {p.DisplayName} @ ({p.Position.X:F1}, {p.Position.Y:F1}, {p.Position.Z:F1})");
+            }
+            else if (MultiplayerState.IsClient)
+            {
+                var trackedOres = _clientOreByNetId.Count;
+                sb.AppendLine($"Tracked ores: {trackedOres}  |  Waiting snapshot: {_clientWaitingForSnapshot}");
+                sb.AppendLine($"Scene ready: {_clientSceneReady}  |  Loading: {_clientLoadingScene}");
+            }
+
+            return sb.ToString();
+        }
+
+        /// <summary>Force a full resync: host rebuilds snapshot for all clients, client requests resync from host.</summary>
+        public void ForceResync()
+        {
+            if (MultiplayerState.IsHost && _net != null)
+            {
+                if (!IsGameSceneReady()) { _log.LogWarning("[Debug] Scene not ready for resync"); return; }
+                var snapshot = BuildSnapshot();
+                _net.SendToAll(MessageType.FullSnapshot, snapshot);
+                _log.LogInfo("[Debug] Force-sent full snapshot to all clients");
+                LogEvent("Force resync sent to all clients.");
+            }
+            else if (MultiplayerState.IsClient && _net != null)
+            {
+                _clientWaitingForSnapshot = true;
+                _net.SendToHost(MessageType.ResyncRequest, _tick);
+                _log.LogInfo("[Debug] Requested resync from host");
+                LogEvent("Requested resync from host.");
+            }
+        }
+
+        /// <summary>Add debug money to the economy. Host-only; triggers money dirty flag for sync.</summary>
+        public void AddDebugMoney(float amount)
+        {
+            if (!IsGameSceneReady()) return;
+            var eco = Singleton<EconomyManager>.Instance;
+            if (eco == null) return;
+
+            EconomyPatch.NetworkBypass = true;
+            try
+            {
+                eco.AddMoney(amount);
+                DirtyTracker.MoneyDirty = true;
+            }
+            finally { EconomyPatch.NetworkBypass = false; }
+
+            _log.LogInfo($"[Debug] Added ${amount:N0} debug money (total: ${eco.Money:N0})");
+            LogEvent($"Added ${amount:N0} debug money.");
+        }
+
+        /// <summary>Log a detailed snapshot dump to BepInEx log for debugging.</summary>
+        public void DumpSnapshot()
+        {
+            if (!IsGameSceneReady()) { _log.LogInfo("[Debug] Scene not ready"); return; }
+
+            WorldSnapshot snapshot;
+            if (MultiplayerState.IsHost)
+                snapshot = BuildSnapshot();
+            else
+                snapshot = BuildClientSnapshot();
+
+            var diag = WorldHasher.DiagnoseComponents(snapshot);
+            var hash = WorldHasher.ComputeHash(snapshot);
+            _log.LogInfo($"[Debug] === SNAPSHOT DUMP ===");
+            _log.LogInfo($"[Debug] Hash: {hash}");
+            _log.LogInfo($"[Debug] Components: {diag}");
+            _log.LogInfo($"[Debug] Players: {snapshot.Players?.Count ?? 0}");
+            _log.LogInfo($"[Debug] Buildings: {snapshot.Buildings?.Count ?? 0}");
+            _log.LogInfo($"[Debug] Ores: {snapshot.OrePieces?.Count ?? 0}");
+            _log.LogInfo($"[Debug] Conveyors: {snapshot.Conveyors?.Count ?? 0}");
+            _log.LogInfo($"[Debug] Money: {(snapshot.World?.Money ?? 0f):N0}");
+            _log.LogInfo($"[Debug] Research: {snapshot.World?.CompletedResearchIds?.Length ?? 0} completed");
+            _log.LogInfo($"[Debug] Quests: {snapshot.World?.CompletedQuestIds?.Length ?? 0} completed, {snapshot.World?.ActiveQuests?.Length ?? 0} active");
+
+            if (snapshot.Buildings != null)
+            {
+                foreach (var b in snapshot.Buildings)
+                    _log.LogInfo($"[Debug]   Building: {b.SavableObjectId} @ ({b.Position.X:F1},{b.Position.Y:F1},{b.Position.Z:F1}) data={!string.IsNullOrEmpty(b.CustomSaveData)}");
+            }
+
+            LogEvent($"Snapshot dumped to log. Hash={hash}, B={snapshot.Buildings?.Count ?? 0}, O={snapshot.OrePieces?.Count ?? 0}");
+        }
+
+        // ── Debug bot ─────────────────────────────────
+
+        /// <summary>Toggle a fake remote player for local testing. Host only.</summary>
+        public void ToggleDebugBot()
+        {
+            if (!MultiplayerState.IsHost) return;
+
+            _debugBotActive = !_debugBotActive;
+            if (_debugBotActive)
+            {
+                _debugBotAngle = 0f;
+                _players.Add(new PlayerState
+                {
+                    PlayerId = DebugBotPlayerId,
+                    DisplayName = "TestBot"
+                });
+                _log.LogInfo("[Session] Debug bot spawned");
+                LogEvent("Test bot joined.");
+            }
+            else
+            {
+                _players.RemoveAll(p => p.PlayerId == DebugBotPlayerId);
+                RemotePlayerManager.Clear();
+                // Re-push remaining players so host visual is correct
+                RemotePlayerManager.UpdatePlayers(_players, MultiplayerState.LocalPlayerId);
+                _log.LogInfo("[Session] Debug bot removed");
+                LogEvent("Test bot left.");
+            }
+        }
+
+        public bool IsDebugBotActive => _debugBotActive;
+
+        private void UpdateDebugBot()
+        {
+            var bot = _players.Find(p => p.PlayerId == DebugBotPlayerId);
+            if (bot == null) return;
+
+            // Circle around the host player at radius 4, ~0.25 rev/sec
+            _debugBotAngle += 0.25f * (1f / 20f) * 2f * Mathf.PI; // 20 tps assumed
+            if (_debugBotAngle > 2f * Mathf.PI) _debugBotAngle -= 2f * Mathf.PI;
+
+            var hostPlayer = _players.Find(p => p.PlayerId == 0);
+            var center = hostPlayer?.Position.ToUnity() ?? Vector3.zero;
+            bot.Position = new NetVector3(
+                center.x + Mathf.Cos(_debugBotAngle) * 4f,
+                center.y,
+                center.z + Mathf.Sin(_debugBotAngle) * 4f);
+
+            // Face the direction of movement
+            float nextAngle = _debugBotAngle + 0.05f;
+            var forward = new Vector3(
+                Mathf.Cos(nextAngle) * 4f - Mathf.Cos(_debugBotAngle) * 4f,
+                0,
+                Mathf.Sin(nextAngle) * 4f - Mathf.Sin(_debugBotAngle) * 4f);
+            if (forward.sqrMagnitude > 0.001f)
+                bot.Rotation = new NetQuaternion(Quaternion.LookRotation(forward));
+
+            // Cycle through tools every 4 seconds so host can see all visuals
+            int toolIndex = ((int)(Time.time / 4f)) % DebugBotTools.Length;
+            bot.EquippedTool = DebugBotTools[toolIndex];
+        }
+
+        // ── Lifecycle ────────────────────────────────
+
+        public void Stop()
+        {
+            _log.LogInfo($"[Session] Stop() called from:\n{System.Environment.StackTrace}");
+            LeaveLobby();
+            _net?.Stop();
+            _net = null;
+            _pendingHost = false;
+            _clientLoadingScene = false;
+            _clientSceneReady = false;
+            _clientWaitingForConnect = false;
+            _clientWaitingForSnapshot = false;
+            _handshakeAckReceived = false;
+            _syncRetryCount = 0;
+            _consecutiveDesyncCount = 0;
+            _debugBotActive = false;
+            bool wasOnline = MultiplayerState.IsOnline || Phase != LobbyPhase.None;
+            Phase = LobbyPhase.None;
+            MultiplayerState.CurrentRole = MultiplayerState.Role.Offline;
+            _players.Clear();
+            _clientNames.Clear();
+            _cachedPlayerController = null;
+            _loggedFirstDelta = false;
+            _hostOreInstanceToNetId.Clear();
+            _clientOreByNetId.Clear();
+            _lastSentOrePositions.Clear();
+            _clientLastSentOrePos.Clear();
+            _lastValidToolName = null;
+            _toolNullTicks = 0;
+            _nextOreNetId = 1;
+            LobbyPlayerNames.Clear();
+            RemotePlayerManager.Clear();
+            _log.LogInfo("[Session] Stopped");
+            if (wasOnline) LogEvent("Multiplayer session ended.");
+        }
+
+        public void Dispose()
+        {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+            SteamMatchmaking.OnLobbyInvite -= OnLobbyInvite;
+            SteamMatchmaking.OnLobbyMemberJoined -= OnLobbyMemberJoined;
+            SteamMatchmaking.OnLobbyMemberLeave -= OnLobbyMemberLeave;
+            SteamMatchmaking.OnLobbyDataChanged -= OnLobbyDataChanged;
+            SteamFriends.OnGameLobbyJoinRequested -= OnGameLobbyJoinRequested;
+            Stop();
+            SteamClient.Shutdown();
+            if (Instance == this) Instance = null;
+        }
+
+        // ── Steam Lobby ────────────────────────────────
+
+        /// <summary>Current Steam lobby (if hosting). Used for friend invites.</summary>
+        public Steamworks.Data.Lobby? CurrentLobby => _lobby;
+
+        private void LeaveLobby()
+        {
+            if (_lobby.HasValue)
+            {
+                _lobby.Value.Leave();
+                _lobby = null;
+                _log.LogInfo("[Session] Left Steam Lobby");
+            }
+        }
+
+        /// <summary>Invite a specific friend to the current lobby.</summary>
+        public bool InviteFriendToLobby(SteamId friendId)
+        {
+            if (!_lobby.HasValue) return false;
+            return _lobby.Value.InviteFriend(friendId);
+        }
+
+        private void OnLobbyInvite(Friend friend, Steamworks.Data.Lobby lobby)
+        {
+            _log.LogInfo($"[Session] Received lobby invite from {friend.Name} (lobby {lobby.Id})");
+            LogEvent($"Lobby invite from {friend.Name}");
+        }
+
+        private void OnLobbyMemberJoined(Steamworks.Data.Lobby lobby, Friend friend)
+        {
+            _log.LogInfo($"[Session] {friend.Name} joined the lobby");
+            RefreshLobbyPlayers();
+        }
+
+        private void OnLobbyMemberLeave(Steamworks.Data.Lobby lobby, Friend friend)
+        {
+            _log.LogInfo($"[Session] {friend.Name} left the lobby");
+            RefreshLobbyPlayers();
+        }
+
+        private void OnLobbyDataChanged(Steamworks.Data.Lobby lobby)
+        {
+            // Client: check if host launched the game
+            if (Phase == LobbyPhase.InLobby && _lobby.HasValue && lobby.Id == _lobby.Value.Id)
+            {
+                var state = lobby.GetData("state");
+                if (state == "launching" || state == "ingame")
+                {
+                    HandleLobbyLaunch();
+                }
+            }
+        }
+
+        private void OnGameLobbyJoinRequested(Steamworks.Data.Lobby lobby, SteamId friendId)
+        {
+            _log.LogInfo($"[Session] Friend {friendId} wants to join via lobby invite/overlay");
+
+            // If already in a session, ignore
+            if (Phase != LobbyPhase.None)
+            {
+                _log.LogWarning($"[Session] Already in phase {Phase}, ignoring lobby join request");
+                return;
+            }
+
+            // Join the lobby (not P2P — just the Steam lobby)
+            var playerName = SteamClient.Name ?? "Player";
+            JoinLobbyDirect(lobby, playerName);
+        }
+
+        // ── Event log helpers ────────────────────────
+
+        private static void LogEvent(string msg)
+        {
+            try { EventLog.Instance?.LogSystem(msg); }
+            catch (System.Exception) { /* never let logging crash the session */ }
+        }
+
+        private static void LogJoin(string name)
+        {
+            EventLog.Instance?.LogJoin(name);
+        }
+
+        private static void LogLeave(string name)
+        {
+            EventLog.Instance?.LogLeave(name);
+        }
+    }
+}
