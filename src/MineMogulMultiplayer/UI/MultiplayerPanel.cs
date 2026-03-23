@@ -221,6 +221,12 @@ namespace MineMogulMultiplayer.UI
             titleLe.flexibleWidth = 1;
             titleLe.preferredHeight = 24; titleLe.minHeight = 24;
 
+            // Version label next to title
+            var verText = UIFactory.CreateText(header, "Version", $"v{PluginInfo.Version}", 9, TextAlignmentOptions.MidlineRight);
+            verText.color = new Color(0.6f, 0.6f, 0.6f, 0.8f);
+            var verLe = verText.gameObject.AddComponent<LayoutElement>();
+            verLe.preferredWidth = 40; verLe.preferredHeight = 24; verLe.flexibleWidth = 0;
+
             // Small X close button — plain text style
             var closeBtnGo = new GameObject("CloseBtn", typeof(RectTransform));
             closeBtnGo.transform.SetParent(header, false);

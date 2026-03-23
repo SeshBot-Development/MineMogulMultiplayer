@@ -117,7 +117,9 @@
     </EmbeddedResource>
   </ItemGroup>
 
-  <!-- Post-build: copy all mod DLLs to BepInEx plugins folder -->
+  <!-- Post-build copy disabled — auto-updater handles deployment via GitHub Releases.
+       To manually deploy, copy build_out/*.dll to BepInEx/plugins/MineMogulMultiplayer/ -->
+  <!--
   <Target Name="CopyToPlugins" AfterTargets="Build">
     <ItemGroup>
       <PluginFiles Include="$(TargetDir)MineMogulMultiplayer.dll" />
@@ -135,5 +137,6 @@
     </ItemGroup>
     <Copy SourceFiles="@(PluginFiles)" DestinationFolder="$(BepInExDir)\plugins\MineMogulMultiplayer" SkipUnchangedFiles="true" />
   </Target>
+  -->
 
 </Project>
