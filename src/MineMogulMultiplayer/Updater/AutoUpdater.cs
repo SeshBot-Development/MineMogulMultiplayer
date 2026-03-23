@@ -133,45 +133,49 @@ namespace MineMogulMultiplayer.Updater
         {
             try
             {
-                var req = (HttpWebRequest)WebRequest.Create(url);
-                req.Method = "GET";
-                req.UserAgent = "MineMogulMultiplayer-Updater";
-                req.Headers["Authorization"] = $"Bearer {token}";
-                req.Accept = "application/vnd.github+json";
-                req.Timeout = 15000;
-
-                using (var resp = (HttpWebResponse)req.GetResponse())
-                using (var reader = new StreamReader(resp.GetResponseStream()))
-                    return reader.ReadToEnd();
+                using (var wc = new WebClient())
+                {
+                    wc.Headers[HttpRequestHeader.UserAgent] = "MineMogulMultiplayer-Updater";
+                    wc.Headers[HttpRequestHeader.Authorization] = $"token {token}";
+                    wc.Headers[HttpRequestHeader.Accept] = "application/vnd.github+json";
+                    return wc.DownloadString(url);
+                }
             }
             catch (WebException ex)
             {
-                if (ex.Response is HttpWebResponse hr && (int)hr.StatusCode == 404)
+                var statusCode = -1;
+                var responseBody = "";
+                if (ex.Response is HttpWebResponse hr)
+                {
+                    statusCode = (int)hr.StatusCode;
+                    try
+                    {
+                        using (var sr = new StreamReader(hr.GetResponseStream()))
+                            responseBody = sr.ReadToEnd();
+                    }
+                    catch { }
+                }
+
+                if (statusCode == 404)
                     _log.LogInfo("[Updater] No releases published yet");
                 else
-                    _log.LogWarning($"[Updater] API request failed: {ex.Message}");
+                    _log.LogWarning($"[Updater] API request failed (HTTP {statusCode}): {ex.Message}");
+
+                if (!string.IsNullOrEmpty(responseBody))
+                    _log.LogWarning($"[Updater] Response: {responseBody.Substring(0, Math.Min(500, responseBody.Length))}");
+
                 return null;
             }
         }
 
         private static void DownloadAsset(string assetApiUrl, string token, string destPath)
         {
-            var req = (HttpWebRequest)WebRequest.Create(assetApiUrl);
-            req.Method = "GET";
-            req.UserAgent = "MineMogulMultiplayer-Updater";
-            req.Headers["Authorization"] = $"Bearer {token}";
-            req.Accept = "application/octet-stream"; // triggers binary download + 302 redirect
-            req.AllowAutoRedirect = true;
-            req.Timeout = 60000;
-
-            using (var resp = req.GetResponse())
-            using (var stream = resp.GetResponseStream())
-            using (var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write))
+            using (var wc = new WebClient())
             {
-                var buf = new byte[65536];
-                int read;
-                while ((read = stream.Read(buf, 0, buf.Length)) > 0)
-                    fs.Write(buf, 0, read);
+                wc.Headers[HttpRequestHeader.UserAgent] = "MineMogulMultiplayer-Updater";
+                wc.Headers[HttpRequestHeader.Authorization] = $"token {token}";
+                wc.Headers[HttpRequestHeader.Accept] = "application/octet-stream";
+                wc.DownloadFile(assetApiUrl, destPath);
             }
         }
 
