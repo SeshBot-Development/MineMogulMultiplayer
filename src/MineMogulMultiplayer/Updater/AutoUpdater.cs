@@ -23,6 +23,11 @@ namespace MineMogulMultiplayer.Updater
         private const string AssetName = "MineMogulMultiplayer-mod.zip";
         private const string ApiBase = "https://api.github.com";
 
+        // Embedded read-only PAT (base64) — allows all mod users to receive updates
+        // from the private repo without needing their own token file.
+        private const string EmbeddedTokenB64 =
+            "Z2l0aHViX3BhdF8xMUJIQUczQlkweGhtY29DS1JRYktlX3JjQ2V4a1JVcjQyQ3N5a1lzbUU5YXQ5WkFXZnU3Q1pVam1CbWZJTGQxcnBDVk9CWVlZQVU2Mk1PNWpH";
+
         private static ManualLogSource _log;
 
         /// <summary>Kick off the update check on a background thread so it never blocks the game.</summary>
@@ -42,15 +47,25 @@ namespace MineMogulMultiplayer.Updater
 
         private static void Run(string modDir, string currentVersion)
         {
-            // ── 1. Read auth token ──────────────────────────────────────
+            // ── 1. Resolve auth token: file override > embedded ─────────
+            string token = null;
             var tokenPath = Path.Combine(modDir, "update_token.txt");
-            if (!File.Exists(tokenPath))
+            if (File.Exists(tokenPath))
             {
-                _log.LogInfo("[Updater] No update_token.txt — auto-update disabled");
+                var fileToken = File.ReadAllText(tokenPath).Trim();
+                if (!string.IsNullOrEmpty(fileToken))
+                    token = fileToken;
+            }
+            if (string.IsNullOrEmpty(token))
+            {
+                try { token = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(EmbeddedTokenB64)); }
+                catch { }
+            }
+            if (string.IsNullOrEmpty(token))
+            {
+                _log.LogWarning("[Updater] No token available — auto-update disabled");
                 return;
             }
-            var token = File.ReadAllText(tokenPath).Trim();
-            if (string.IsNullOrEmpty(token)) return;
 
             // TLS 1.2 required by GitHub
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
