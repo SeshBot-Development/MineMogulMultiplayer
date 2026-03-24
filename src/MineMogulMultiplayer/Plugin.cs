@@ -40,8 +40,12 @@ namespace MineMogulMultiplayer
             DontDestroyOnLoad(gameObject);
 
             // Synchronous update check — if an update is found, it downloads,
-            // extracts, and restarts the game automatically.
+            // stages files, launches a copy script, and restarts the game.
             var modDir = System.IO.Path.GetDirectoryName(Info.Location);
+
+            // Apply any staged update from a previous run (files copied by batch script)
+            AutoUpdater.ApplyPendingUpdate(modDir, Logger);
+
             if (AutoUpdater.CheckAndApply(modDir, Core.PluginInfo.Version, Logger))
                 return; // Game is restarting, don't initialize anything
 
@@ -150,7 +154,10 @@ namespace MineMogulMultiplayer
 
             // Smooth interpolation for remote player visuals (every frame, only during gameplay)
             if (MultiplayerState.IsOnline)
+            {
                 RemotePlayerManager.Interpolate();
+                _session.InterpolateItems();
+            }
 
             _tickTimer += Time.deltaTime;
             if (_tickTimer >= _tickInterval)

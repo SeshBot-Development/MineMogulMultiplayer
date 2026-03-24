@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -88,6 +89,7 @@ namespace MineMogulMultiplayer.Core
         private readonly List<BuildingRemovalInfo> _poolRemovedBuildings = new List<BuildingRemovalInfo>();
         private readonly HashSet<int> _poolDirtyMachines = new HashSet<int>();
         private readonly HashSet<int> _poolDirtyBelts = new HashSet<int>();
+        private readonly HashSet<int> _poolDirtyDetonators = new HashSet<int>();
         private readonly HashSet<int> _oreCurrentIds = new HashSet<int>(); // reused in DetectOreChanges
 
         // ── Ore position sync (host tracks last-sent positions, sends updates for moved ores) ──
@@ -104,6 +106,13 @@ namespace MineMogulMultiplayer.Core
         // ── Crate position sync ──
         private readonly Dictionary<int, Vector3> _lastSentCratePositions = new Dictionary<int, Vector3>();
         private readonly List<CratePositionUpdate> _poolCratePositionUpdates = new List<CratePositionUpdate>();
+
+        // ── Smooth interpolation targets for ore/crate positions on client ──
+        private readonly Dictionary<int, Vector3> _oreTargetPositions = new Dictionary<int, Vector3>();
+        private readonly Dictionary<int, Quaternion> _oreTargetRotations = new Dictionary<int, Quaternion>();
+        private readonly Dictionary<int, Vector3> _crateTargetPositions = new Dictionary<int, Vector3>();
+        private readonly Dictionary<int, Quaternion> _crateTargetRotations = new Dictionary<int, Quaternion>();
+        private const float ItemInterpolationSpeed = 18f; // higher = snappier tracking
         // Host-side guard against transient empty-tool packets that cause remote flicker.
         private readonly Dictionary<int, string> _hostLastToolByPlayerId = new Dictionary<int, string>();
         private readonly Dictionary<int, int> _hostEmptyToolTicksByPlayerId = new Dictionary<int, int>();
@@ -119,7 +128,8 @@ namespace MineMogulMultiplayer.Core
 
         // ── Remotely-held ore kinematic management ──
         private readonly Dictionary<int, float> _remotelyHeldOres = new Dictionary<int, float>(); // netId → lastUpdateTime
-        private const float RemoteHoldTimeout = 1.5f; // seconds before ore returns to physics
+        private readonly Dictionary<int, float> _remotelyHeldCrates = new Dictionary<int, float>(); // netId → lastUpdateTime
+        private const float RemoteHoldTimeout = 0.8f; // seconds before ore returns to physics
 
         // ── Debug bot (local testing without a second player) ──
         private bool _debugBotActive;
@@ -143,6 +153,12 @@ namespace MineMogulMultiplayer.Core
         private string _debugBotLastTool;
         /// <summary>True once the audit has run for this boot (avoid spamming logs).</summary>
         private bool _debugBotAuditDone;
+
+        // ── Player inventory persistence (host tracks per-player tools by SteamID) ──
+        private readonly Dictionary<ulong, string[]> _savedPlayerInventories = new Dictionary<ulong, string[]>();
+        private string _hostSaveFilePath; // set when LaunchGame is called, used for companion file
+        // Map clientId → SteamId for inventory tracking
+        private readonly Dictionary<uint, ulong> _clientSteamIds = new Dictionary<uint, ulong>();
 
         // ── Steam Lobby (for invites & friend joining) ──
         private Steamworks.Data.Lobby? _lobby;
@@ -712,6 +728,10 @@ namespace MineMogulMultiplayer.Core
             // P2P host will start AFTER scene loads (in OnSceneLoaded) to avoid
             // race conditions where clients connect before the host is ready.
             _pendingHost = true;
+            _hostSaveFilePath = fullFilePath;
+
+            // Load saved multiplayer data (player inventories) from companion file
+            LoadMultiplayerCompanionData();
 
             // Load the save
             var slm = Singleton<SavingLoadingManager>.Instance;
@@ -878,7 +898,8 @@ namespace MineMogulMultiplayer.Core
                 _net.SendToHost(MessageType.Handshake, new HandshakeMessage
                 {
                     PlayerName = playerName,
-                    ModVersion = PluginInfo.Version
+                    ModVersion = PluginInfo.Version,
+                    SteamId = SteamClient.SteamId
                 });
                 _log.LogInfo("[Session] P2P connected to host, sent handshake");
                 LogEvent("Connected to host!");
@@ -995,8 +1016,23 @@ namespace MineMogulMultiplayer.Core
 
             UpdateHostPlayerState();
 
+            // Detect item drops/throws and send velocity to clients
+            if (_cachedPlayerController != null)
+                DetectAndSendItemDrop(_cachedPlayerController);
+
             // Detect ore changes by diffing AllOrePieces against known set
             DetectOreChanges();
+
+            // Periodically refresh all machine states for clients (~every 6 seconds)
+            if (_tick % 120 == 0)
+            {
+                foreach (var bo in UnityEngine.Object.FindObjectsByType<BuildingObject>(FindObjectsSortMode.None))
+                {
+                    if (bo.IsGhost) continue;
+                    if (bo is ICustomSaveDataProvider)
+                        DirtyTracker.DirtyMachineInstanceIds.Add(bo.GetInstanceID());
+                }
+            }
 
             // Snapshot dirty state into pooled collections and reset immediately
             _poolSpawnedOres.Clear();
@@ -1009,6 +1045,8 @@ namespace MineMogulMultiplayer.Core
             foreach (var id in DirtyTracker.DirtyMachineInstanceIds) _poolDirtyMachines.Add(id);
             _poolDirtyBelts.Clear();
             foreach (var id in DirtyTracker.DirtyBeltIds) _poolDirtyBelts.Add(id);
+            _poolDirtyDetonators.Clear();
+            foreach (var id in DirtyTracker.DirtyDetonatorIds) _poolDirtyDetonators.Add(id);
             bool tickMoneyDirty = DirtyTracker.MoneyDirty;
             bool tickResearchDirty = DirtyTracker.ResearchDirty;
             bool tickQuestDirty = DirtyTracker.QuestDirty;
@@ -1040,7 +1078,7 @@ namespace MineMogulMultiplayer.Core
             // Host also needs to see remote player visuals
             RemotePlayerManager.UpdatePlayers(_players, MultiplayerState.LocalPlayerId);
 
-            var delta = BuildDelta(_poolDirtyMachines, _poolDirtyBelts, _poolRemovedBuildings, tickMoneyDirty, tickResearchDirty, tickQuestDirty, tickContractDirty, tickShopPurchaseDirty, tickActiveQuestProgressDirty);
+            var delta = BuildDelta(_poolDirtyMachines, _poolDirtyBelts, _poolDirtyDetonators, _poolRemovedBuildings, tickMoneyDirty, tickResearchDirty, tickQuestDirty, tickContractDirty, tickShopPurchaseDirty, tickActiveQuestProgressDirty);
             if (delta != null)
             {
                 // Always send reliably — unreliable delivery over Steam relay was dropping
@@ -1254,43 +1292,92 @@ namespace MineMogulMultiplayer.Core
             }
         }
 
-        /// <summary>Release ores back to physics after they've stopped being remotely updated.</summary>
+        /// <summary>Release ores and crates back to physics after they've stopped being remotely updated.</summary>
         private void ReleaseStaleRemoteOres()
         {
-            if (_remotelyHeldOres.Count == 0) return;
             var now = UnityEngine.Time.unscaledTime;
-            var toRelease = new List<int>();
-            foreach (var kv in _remotelyHeldOres)
+
+            // Release stale ores
+            if (_remotelyHeldOres.Count > 0)
             {
-                if (now - kv.Value > RemoteHoldTimeout)
-                    toRelease.Add(kv.Key);
-            }
-            foreach (var netId in toRelease)
-            {
-                _remotelyHeldOres.Remove(netId);
-                // Find the ore and make it non-kinematic
-                OrePiece foundOre = null;
-                if (MultiplayerState.IsHost)
+                var toRelease = new List<int>();
+                foreach (var kv in _remotelyHeldOres)
                 {
-                    foreach (var kv in _hostOreInstanceToNetId)
+                    if (now - kv.Value > RemoteHoldTimeout)
+                        toRelease.Add(kv.Key);
+                }
+                foreach (var netId in toRelease)
+                {
+                    _remotelyHeldOres.Remove(netId);
+                    _oreTargetPositions.Remove(netId);
+                    _oreTargetRotations.Remove(netId);
+                    OrePiece foundOre = null;
+                    if (MultiplayerState.IsHost)
                     {
-                        if (kv.Value != netId) continue;
-                        foreach (var ore in OrePiece.AllOrePieces)
+                        foreach (var kv in _hostOreInstanceToNetId)
                         {
-                            if (ore != null && ore.GetInstanceID() == kv.Key)
-                            { foundOre = ore; break; }
+                            if (kv.Value != netId) continue;
+                            foreach (var ore in OrePiece.AllOrePieces)
+                            {
+                                if (ore != null && ore.GetInstanceID() == kv.Key)
+                                { foundOre = ore; break; }
+                            }
+                            break;
                         }
-                        break;
+                    }
+                    else if (_clientOreByNetId.TryGetValue(netId, out var clientOre))
+                    {
+                        foundOre = clientOre;
+                    }
+                    if (foundOre != null)
+                    {
+                        var rb = foundOre.GetComponent<Rigidbody>();
+                        if (rb != null) rb.isKinematic = false;
                     }
                 }
-                else if (_clientOreByNetId.TryGetValue(netId, out var clientOre))
+            }
+
+            // Release stale crates
+            if (_remotelyHeldCrates.Count > 0)
+            {
+                var toRelease = new List<int>();
+                foreach (var kv in _remotelyHeldCrates)
                 {
-                    foundOre = clientOre;
+                    if (now - kv.Value > RemoteHoldTimeout)
+                        toRelease.Add(kv.Key);
                 }
-                if (foundOre != null)
+                foreach (var netId in toRelease)
                 {
-                    var rb = foundOre.GetComponent<Rigidbody>();
-                    if (rb != null) rb.isKinematic = false;
+                    _remotelyHeldCrates.Remove(netId);
+                    _crateTargetPositions.Remove(netId);
+                    _crateTargetRotations.Remove(netId);
+                    if (MultiplayerState.IsHost)
+                    {
+                        // Find host crate by reverse lookup
+                        int instanceId = -1;
+                        foreach (var kv in _hostCrateInstanceToNetId)
+                        {
+                            if (kv.Value == netId) { instanceId = kv.Key; break; }
+                        }
+                        if (instanceId >= 0)
+                        {
+                            var allCrates = UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None);
+                            foreach (var crate in allCrates)
+                            {
+                                if (crate != null && crate.GetInstanceID() == instanceId)
+                                {
+                                    var rb = crate.GetComponent<Rigidbody>();
+                                    if (rb != null) rb.isKinematic = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    else if (_clientCrateByNetId.TryGetValue(netId, out var clientCrate) && clientCrate != null)
+                    {
+                        var rb = clientCrate.GetComponent<Rigidbody>();
+                        if (rb != null) rb.isKinematic = false;
+                    }
                 }
             }
         }
@@ -1303,6 +1390,40 @@ namespace MineMogulMultiplayer.Core
         // ── Client crate position tracking ──
         private readonly Dictionary<int, Vector3> _clientLastSentCratePos = new Dictionary<int, Vector3>();
         private readonly List<CratePositionUpdate> _clientCrateUpdatePool = new List<CratePositionUpdate>();
+        /// <summary>Net IDs of crates the client is currently holding/moving locally. Skip host position updates for these.</summary>
+        private readonly HashSet<int> _clientLocallyHeldCrates = new HashSet<int>();
+
+        /// <summary>
+        /// Smoothly interpolate ore and crate positions toward their network targets.
+        /// Call from Update (every frame) for smooth visual movement on the client.
+        /// </summary>
+        public void InterpolateItems()
+        {
+            if (!MultiplayerState.IsClient) return;
+
+            float dt = UnityEngine.Time.deltaTime;
+            float t = ItemInterpolationSpeed * dt;
+
+            // Interpolate ores
+            foreach (var kv in _oreTargetPositions)
+            {
+                if (_clientLocallyHeldOres.Contains(kv.Key)) continue;
+                if (!_clientOreByNetId.TryGetValue(kv.Key, out var ore) || ore == null) continue;
+                ore.transform.position = Vector3.Lerp(ore.transform.position, kv.Value, t);
+                if (_oreTargetRotations.TryGetValue(kv.Key, out var targetRot))
+                    ore.transform.rotation = Quaternion.Slerp(ore.transform.rotation, targetRot, t);
+            }
+
+            // Interpolate crates
+            foreach (var kv in _crateTargetPositions)
+            {
+                if (_clientLocallyHeldCrates.Contains(kv.Key)) continue;
+                if (!_clientCrateByNetId.TryGetValue(kv.Key, out var crate) || crate == null) continue;
+                crate.transform.position = Vector3.Lerp(crate.transform.position, kv.Value, t);
+                if (_crateTargetRotations.TryGetValue(kv.Key, out var targetRot))
+                    crate.transform.rotation = Quaternion.Slerp(crate.transform.rotation, targetRot, t);
+            }
+        }
 
         private void TickClient()
         {
@@ -1329,7 +1450,8 @@ namespace MineMogulMultiplayer.Core
                         _net.SendToHost(MessageType.Handshake, new HandshakeMessage
                         {
                             PlayerName = _pendingPlayerName ?? SteamClient.Name ?? "Player",
-                            ModVersion = PluginInfo.Version
+                            ModVersion = PluginInfo.Version,
+                            SteamId = SteamClient.SteamId
                         });
                     }
                     else
@@ -1376,7 +1498,10 @@ namespace MineMogulMultiplayer.Core
 
                     // Send position updates for ores the client is holding/moving
                     if (pc != null)
+                    {
                         SendClientOrePositions(pc);
+                        DetectAndSendItemDrop(pc);
+                    }
                 }
                 else if (_tick % 40 == 0) // Log every 2 seconds if controller is missing
                 {
@@ -1386,6 +1511,13 @@ namespace MineMogulMultiplayer.Core
 
             // Release ores that haven't been remotely updated recently
             ReleaseStaleRemoteOres();
+
+            // Periodically report inventory to host for save persistence
+            if (_tick % 60 == 0 && _net != null && _net.IsRunning)
+            {
+                try { SendClientInventoryReport(); }
+                catch (Exception ex) { _log.LogWarning($"[Session] Inventory report failed: {ex.Message}"); }
+            }
         }
 
         /// <summary>
@@ -1398,6 +1530,7 @@ namespace MineMogulMultiplayer.Core
             _clientOreUpdatePool.Clear();
             _clientLocallyHeldOres.Clear();
             _clientCrateUpdatePool.Clear();
+            _clientLocallyHeldCrates.Clear();
 
             // Check for hand-grabbed object
             try
@@ -1417,20 +1550,45 @@ namespace MineMogulMultiplayer.Core
             }
             catch { /* HeldObject may not exist in this game version */ }
 
-            // Check for magnet-held ores: scan ores near the player that are moving
+            // Check for magnet-held ores: scan nearby ores for any joint or velocity
             var playerPos = pc.transform.position;
+            bool hasMagnet = false;
+            try
+            {
+                var toolName = _lastValidToolName;
+                if (string.IsNullOrEmpty(toolName)) toolName = GetEquippedToolName(pc);
+                hasMagnet = !string.IsNullOrEmpty(toolName) &&
+                            toolName.IndexOf("Magnet", System.StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch { }
+
             foreach (var kv in _clientOreByNetId)
             {
                 var ore = kv.Value;
                 if (ore == null) continue;
 
-                // Only check ores within magnet range (~5 units of player)
-                if (Vector3.SqrMagnitude(ore.transform.position - playerPos) > 25f) continue;
+                float sqrDist = Vector3.SqrMagnitude(ore.transform.position - playerPos);
 
-                // Check if this ore has a SpringJoint (sign it's being grabbed or magneted)
-                var joint = ore.GetComponent<SpringJoint>();
-                if (joint != null)
-                    TryAddClientOreUpdate(ore);
+                // Check for any joint component (SpringJoint, FixedJoint, ConfigurableJoint, etc.)
+                if (sqrDist < 225f) // 15m
+                {
+                    var joint = ore.GetComponent<Joint>();
+                    if (joint != null)
+                    {
+                        TryAddClientOreUpdate(ore);
+                        continue;
+                    }
+                }
+
+                // If magnet equipped, detect ores with velocity within range (being attracted)
+                if (hasMagnet && sqrDist < 100f) // 10m
+                {
+                    var rb = ore.GetComponent<Rigidbody>();
+                    if (rb != null && !rb.isKinematic && rb.linearVelocity.sqrMagnitude > 0.25f)
+                    {
+                        TryAddClientOreUpdate(ore);
+                    }
+                }
             }
 
             if (_clientOreUpdatePool.Count > 0)
@@ -1487,6 +1645,14 @@ namespace MineMogulMultiplayer.Core
                 if (kv.Value == crate) { netId = kv.Key; break; }
             }
             if (netId < 0) return;
+
+            // Mark this crate as locally held so host position updates are skipped
+            _clientLocallyHeldCrates.Add(netId);
+
+            // Make sure the crate is non-kinematic so the client can move it
+            var rb = crate.GetComponent<Rigidbody>();
+            if (rb != null && rb.isKinematic)
+                rb.isKinematic = false;
 
             var pos = crate.transform.position;
             if (_clientLastSentCratePos.TryGetValue(netId, out var lastPos))
@@ -2274,6 +2440,14 @@ namespace MineMogulMultiplayer.Core
                         var purchaseMsg = NetSerializer.Deserialize<ShopPurchaseNotifyMessage>(payload);
                         HandleShopPurchaseNotify(clientId, purchaseMsg);
                         break;
+                    case MessageType.ItemDropped:
+                        var dropMsg = NetSerializer.Deserialize<ItemDroppedMessage>(payload);
+                        HandleItemDropped(clientId, dropMsg);
+                        break;
+                    case MessageType.ClientInventoryReport:
+                        var invReport = NetSerializer.Deserialize<ClientInventoryReportMessage>(payload);
+                        HandleClientInventoryReport(clientId, invReport);
+                        break;
                 }
             }
             catch (Exception ex)
@@ -2380,7 +2554,14 @@ namespace MineMogulMultiplayer.Core
                         ApplyCratePositionUpdates(crateUpdates);
                         break;
                     case MessageType.InventorySync:
-                        // Inventory sync disabled — each player manages their own inventory
+                        var invSync = NetSerializer.Deserialize<InventorySyncMessage>(payload);
+                        if (invSync?.Tools != null && invSync.Tools.Length > 0)
+                            ReconcileToolInventory(invSync.Tools);
+                        break;
+                    case MessageType.ItemDropped:
+                        if (_clientWaitingForSnapshot) break;
+                        var clientDropMsg = NetSerializer.Deserialize<ItemDroppedMessage>(payload);
+                        ApplyItemDropped(clientDropMsg);
                         break;
                 }
             }
@@ -2474,6 +2655,8 @@ namespace MineMogulMultiplayer.Core
             }
 
             _clientNames[clientId] = handshake.PlayerName;
+            if (handshake.SteamId != 0)
+                _clientSteamIds[clientId] = handshake.SteamId;
             _players.Add(new PlayerState
             {
                 PlayerId = (int)clientId,
@@ -2505,6 +2688,13 @@ namespace MineMogulMultiplayer.Core
 
             _log.LogInfo($"[Session] Player '{handshake.PlayerName}' (ID {clientId}) joined");
             LogJoin(handshake.PlayerName);
+
+            // If host has saved inventory for this player, send it
+            if (handshake.SteamId != 0 && _savedPlayerInventories.TryGetValue(handshake.SteamId, out var savedTools))
+            {
+                _log.LogInfo($"[Session] Sending saved inventory ({savedTools.Length} tools) to client {clientId} (Steam {handshake.SteamId})");
+                _net.SendToClient(clientId, MessageType.InventorySync, new InventorySyncMessage { Tools = savedTools });
+            }
         }
 
         private void HandlePlayerInput(uint clientId, PlayerInputMessage input)
@@ -2725,6 +2915,70 @@ namespace MineMogulMultiplayer.Core
         {
             _log.LogInfo($"[Session] Player {clientId} interacting '{msg.Action}' at {msg.Position}");
 
+            // ── Handle detonator actions first (they are NOT BuildingObjects) ──
+            if (msg.Action == "triggerDetonator")
+            {
+                DetonatorTrigger bestTrigger = null;
+                float bestDist = 50f;
+                foreach (var dt in UnityEngine.Object.FindObjectsByType<DetonatorTrigger>(FindObjectsSortMode.None))
+                {
+                    if (dt == null || dt.HasTriggered) continue;
+                    float d = Vector3.Distance(dt.transform.position, msg.Position.ToUnity());
+                    if (d < bestDist) { bestDist = d; bestTrigger = dt; }
+                }
+                if (bestTrigger != null)
+                {
+                    _log.LogInfo($"[Session] Found DetonatorTrigger at dist={bestDist:F2}");
+                    BuildingInteractionPatch.NetworkBypass = true;
+                    try { bestTrigger.Interact(null); }
+                    finally { BuildingInteractionPatch.NetworkBypass = false; }
+                    // NetworkBypass suppresses the postfix dirty-tracking, so mark manually
+                    var det = bestTrigger.GetComponentInParent<DetonatorExplosion>()
+                           ?? bestTrigger.GetComponentInChildren<DetonatorExplosion>();
+                    if (det != null) DirtyTracker.DirtyDetonatorIds.Add(det.DetonatorID);
+                }
+                else
+                {
+                    _log.LogWarning($"[Session] No DetonatorTrigger found near {msg.Position}");
+                }
+                return;
+            }
+
+            if (msg.Action == "buyDetonator")
+            {
+                DetonatorBuySign bestBuy = null;
+                float bestBuyDist = 50f;
+                foreach (var bs in UnityEngine.Object.FindObjectsByType<DetonatorBuySign>(FindObjectsSortMode.None))
+                {
+                    if (bs == null) continue;
+                    float d = Vector3.Distance(bs.transform.position, msg.Position.ToUnity());
+                    if (d < bestBuyDist) { bestBuyDist = d; bestBuy = bs; }
+                }
+                if (bestBuy != null)
+                {
+                    _log.LogInfo($"[Session] Found DetonatorBuySign at dist={bestBuyDist:F2}");
+                    EconomyPatch.NetworkBypass = true;
+                    BuildingInteractionPatch.NetworkBypass = true;
+                    try { bestBuy.TryBuySign(); }
+                    finally
+                    {
+                        EconomyPatch.NetworkBypass = false;
+                        BuildingInteractionPatch.NetworkBypass = false;
+                    }
+                    // NetworkBypass suppresses the postfix dirty-tracking, so mark manually
+                    var det = bestBuy.GetComponentInParent<DetonatorExplosion>()
+                           ?? bestBuy.GetComponentInChildren<DetonatorExplosion>();
+                    if (det != null) DirtyTracker.DirtyDetonatorIds.Add(det.DetonatorID);
+                    DirtyTracker.MoneyDirty = true;
+                }
+                else
+                {
+                    _log.LogWarning($"[Session] No DetonatorBuySign found near {msg.Position}");
+                }
+                return;
+            }
+
+            // ── Standard BuildingObject actions ──
             // Find the closest building to the given position
             BuildingObject target = null;
             float closest = 1.0f;
@@ -2796,36 +3050,6 @@ namespace MineMogulMultiplayer.Core
                         try { sign.UpdateText(msg.Data ?? ""); }
                         finally { BuildingInteractionPatch.NetworkBypass = false; }
                         DirtyTracker.DirtyMachineInstanceIds.Add(target.GetInstanceID());
-                    }
-                    break;
-
-                case "triggerDetonator":
-                    var trigger = target.GetComponent<DetonatorTrigger>();
-                    if (trigger != null && !trigger.HasTriggered)
-                    {
-                        BuildingInteractionPatch.NetworkBypass = true;
-                        try
-                        {
-                            // Call Interact with null — TriggerExplosion is private, Interact calls it
-                            trigger.Interact(null);
-                        }
-                        finally { BuildingInteractionPatch.NetworkBypass = false; }
-                    }
-                    break;
-
-                case "buyDetonator":
-                    var buySign = target.GetComponent<DetonatorBuySign>();
-                    if (buySign != null)
-                    {
-                        EconomyPatch.NetworkBypass = true;
-                        BuildingInteractionPatch.NetworkBypass = true;
-                        try { buySign.TryBuySign(); }
-                        finally
-                        {
-                            EconomyPatch.NetworkBypass = false;
-                            BuildingInteractionPatch.NetworkBypass = false;
-                        }
-                        DirtyTracker.MoneyDirty = true;
                     }
                     break;
 
@@ -2953,6 +3177,10 @@ namespace MineMogulMultiplayer.Core
             // Reconcile crate positions from host
             if (snapshot.Crates != null)
                 ReconcileCratesFromSnapshot(snapshot.Crates);
+
+            // Apply detonator/explosion states (doors blown open, TNT purchased, etc.)
+            if (snapshot.Detonators != null)
+                ApplyDetonatorStates(snapshot.Detonators);
         }
 
         private bool _loggedFirstDelta;
@@ -3078,6 +3306,10 @@ namespace MineMogulMultiplayer.Core
             // Apply building state updates (custom save data)
             if (delta.ChangedBuildings != null && delta.ChangedBuildings.Count > 0)
                 ApplyBuildingUpdates(delta.ChangedBuildings);
+
+            // Apply detonator state changes
+            if (delta.ChangedDetonators != null && delta.ChangedDetonators.Count > 0)
+                ApplyDetonatorStates(delta.ChangedDetonators);
         }
 
         private void ApplyActiveQuestProgress(QuestManager quests, ActiveQuestData[] activeQuests)
@@ -3603,6 +3835,9 @@ namespace MineMogulMultiplayer.Core
                 if (ore != null) ore.Delete();
                 _clientOreByNetId.Remove(networkId);
             }
+            _oreTargetPositions.Remove(networkId);
+            _oreTargetRotations.Remove(networkId);
+            _remotelyHeldOres.Remove(networkId);
         }
 
         /// <summary>Apply ore position updates from host — smoothly moves ore pieces that have changed position.</summary>
@@ -3616,16 +3851,11 @@ namespace MineMogulMultiplayer.Core
 
                 if (_clientOreByNetId.TryGetValue(upd.NetworkId, out var ore) && ore != null)
                 {
-                    ore.transform.position = upd.Position.ToUnity();
-                    ore.transform.rotation = upd.Rotation.ToUnity();
-                    var rb = ore.GetComponent<Rigidbody>();
-                    if (rb != null)
-                    {
-                        rb.isKinematic = true;
-                        rb.linearVelocity = Vector3.zero;
-                        rb.angularVelocity = Vector3.zero;
-                    }
-                    _remotelyHeldOres[upd.NetworkId] = UnityEngine.Time.unscaledTime;
+                    // Set interpolation targets instead of snapping.
+                    // Do NOT set kinematic here — these are general position corrections,
+                    // not "held by remote player." Kinematic ores can't be picked up.
+                    _oreTargetPositions[upd.NetworkId] = upd.Position.ToUnity();
+                    _oreTargetRotations[upd.NetworkId] = upd.Rotation.ToUnity();
                 }
             }
         }
@@ -3710,6 +3940,169 @@ namespace MineMogulMultiplayer.Core
             }
         }
 
+        /// <summary>Host: store the client's inventory report for save persistence.</summary>
+        private void HandleClientInventoryReport(uint clientId, ClientInventoryReportMessage msg)
+        {
+            if (msg == null || msg.SteamId == 0 || msg.Tools == null) return;
+            _savedPlayerInventories[msg.SteamId] = msg.Tools;
+        }
+
+        /// <summary>Client: send our current tool list to the host for save persistence.</summary>
+        private void SendClientInventoryReport()
+        {
+            if (_cachedPlayerController == null)
+                _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
+            if (_cachedPlayerController == null) return;
+
+            var inv = _cachedPlayerController.GetComponent<PlayerInventory>();
+            if (inv == null) return;
+
+            var tools = new List<string>();
+            foreach (var tool in inv.Items)
+            {
+                if (tool == null) continue;
+                var name = tool.SavableObjectID.ToString();
+                if (name == "ToolBuilder") continue;
+                tools.Add(name);
+            }
+
+            _net.SendToHost(MessageType.ClientInventoryReport, new ClientInventoryReportMessage
+            {
+                SteamId = SteamClient.SteamId,
+                Tools = tools.ToArray()
+            });
+        }
+
+        /// <summary>Host: save per-player inventories to a companion JSON file alongside the game save.</summary>
+        public void SaveMultiplayerCompanionData()
+        {
+            if (string.IsNullOrEmpty(_hostSaveFilePath)) return;
+
+            // Also capture host's own inventory
+            try
+            {
+                var hostInv = BuildInventorySyncMessage();
+                if (hostInv?.Tools != null)
+                    _savedPlayerInventories[SteamClient.SteamId] = hostInv.Tools;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning($"[Session] Failed to capture host inventory: {ex.Message}");
+            }
+
+            if (_savedPlayerInventories.Count == 0) return;
+
+            var companionPath = GetCompanionFilePath(_hostSaveFilePath);
+            try
+            {
+                // Simple JSON: { "steamId": ["tool1","tool2"], ... }
+                var sb = new System.Text.StringBuilder();
+                sb.Append('{');
+                bool first = true;
+                foreach (var kv in _savedPlayerInventories)
+                {
+                    if (!first) sb.Append(',');
+                    first = false;
+                    sb.Append('"').Append(kv.Key).Append("\":[");
+                    for (int i = 0; i < kv.Value.Length; i++)
+                    {
+                        if (i > 0) sb.Append(',');
+                        sb.Append('"').Append(EscapeJsonString(kv.Value[i])).Append('"');
+                    }
+                    sb.Append(']');
+                }
+                sb.Append('}');
+                File.WriteAllText(companionPath, sb.ToString());
+                _log.LogInfo($"[Session] Saved multiplayer companion data ({_savedPlayerInventories.Count} players) to {companionPath}");
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Session] Failed to save companion data: {ex}");
+            }
+        }
+
+        /// <summary>Host: load per-player inventories from the companion JSON file.</summary>
+        private void LoadMultiplayerCompanionData()
+        {
+            _savedPlayerInventories.Clear();
+            if (string.IsNullOrEmpty(_hostSaveFilePath)) return;
+
+            var companionPath = GetCompanionFilePath(_hostSaveFilePath);
+            if (!File.Exists(companionPath)) return;
+
+            try
+            {
+                var json = File.ReadAllText(companionPath);
+                // Minimal JSON parser for our simple format: { "steamId": ["tool1","tool2"], ... }
+                ParseCompanionJson(json);
+                _log.LogInfo($"[Session] Loaded multiplayer companion data ({_savedPlayerInventories.Count} players) from {companionPath}");
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Session] Failed to load companion data: {ex}");
+            }
+        }
+
+        private static string GetCompanionFilePath(string saveFilePath)
+        {
+            var dir = Path.GetDirectoryName(saveFilePath);
+            var name = Path.GetFileNameWithoutExtension(saveFilePath);
+            return Path.Combine(dir, name + "_multiplayer.json");
+        }
+
+        private static string EscapeJsonString(string s)
+        {
+            if (s == null) return "";
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        /// <summary>Parse our simple companion JSON format into _savedPlayerInventories.</summary>
+        private void ParseCompanionJson(string json)
+        {
+            // Format: {"76561198..":["Tool1","Tool2"],"76561199..":["Tool3"]}
+            json = json.Trim();
+            if (json.Length < 2 || json[0] != '{') return;
+            json = json.Substring(1, json.Length - 2); // strip outer braces
+
+            int pos = 0;
+            while (pos < json.Length)
+            {
+                // Find key (steam ID)
+                int keyStart = json.IndexOf('"', pos);
+                if (keyStart < 0) break;
+                int keyEnd = json.IndexOf('"', keyStart + 1);
+                if (keyEnd < 0) break;
+                var keyStr = json.Substring(keyStart + 1, keyEnd - keyStart - 1);
+
+                // Find array start
+                int arrStart = json.IndexOf('[', keyEnd);
+                if (arrStart < 0) break;
+                int arrEnd = json.IndexOf(']', arrStart);
+                if (arrEnd < 0) break;
+
+                var arrContent = json.Substring(arrStart + 1, arrEnd - arrStart - 1);
+                var tools = new List<string>();
+                if (arrContent.Trim().Length > 0)
+                {
+                    int tPos = 0;
+                    while (tPos < arrContent.Length)
+                    {
+                        int tStart = arrContent.IndexOf('"', tPos);
+                        if (tStart < 0) break;
+                        int tEnd = arrContent.IndexOf('"', tStart + 1);
+                        if (tEnd < 0) break;
+                        tools.Add(arrContent.Substring(tStart + 1, tEnd - tStart - 1));
+                        tPos = tEnd + 1;
+                    }
+                }
+
+                if (ulong.TryParse(keyStr, out var steamId))
+                    _savedPlayerInventories[steamId] = tools.ToArray();
+
+                pos = arrEnd + 1;
+            }
+        }
+
         // ── Snapshot / delta builders ────────────────
 
         private WorldSnapshot BuildSnapshot()
@@ -3774,11 +4167,13 @@ namespace MineMogulMultiplayer.Core
                 OrePieces = orePieces,
                 Conveyors = BuildConveyorStates(),
                 Tick = _tick,
-                Crates = BuildCrateStates()
+                Crates = BuildCrateStates(),
+                Detonators = BuildDetonatorStates()
             };
         }
 
         private WorldDelta BuildDelta(HashSet<int> dirtyMachines, HashSet<int> dirtyBelts,
+            HashSet<int> dirtyDetonators,
             List<BuildingRemovalInfo> removedBuildings, bool moneyDirty, bool researchDirty, bool questDirty,
             bool contractDirty, bool shopPurchaseDirty, bool activeQuestProgressDirty)
         {
@@ -3790,7 +4185,8 @@ namespace MineMogulMultiplayer.Core
                                  activeQuestProgressDirty ||
                                  dirtyMachines.Count > 0 ||
                                  removedBuildings.Count > 0 ||
-                                 dirtyBelts.Count > 0;
+                                 dirtyBelts.Count > 0 ||
+                                 dirtyDetonators.Count > 0;
 
             // Always send player positions when there are multiple players
             if (!anythingDirty && _players.Count <= 1)
@@ -3813,7 +4209,8 @@ namespace MineMogulMultiplayer.Core
                 RemovedOrePieceIds = new List<int>(),
                 PlayerUpdates = new List<PlayerState>(_players),
                 World = worldDirty ? BuildWorldState(eco, research, quests, contracts) : null,
-                ChangedConveyors = BuildDirtyConveyors(dirtyBelts)
+                ChangedConveyors = BuildDirtyConveyors(dirtyBelts),
+                ChangedDetonators = BuildDirtyDetonators(dirtyDetonators)
             };
         }
 
@@ -4001,6 +4398,68 @@ namespace MineMogulMultiplayer.Core
                 });
             }
             return result;
+        }
+
+        // ── Detonator state helpers ──
+
+        private List<DetonatorState> BuildDetonatorStates()
+        {
+            var result = new List<DetonatorState>();
+            foreach (var det in UnityEngine.Object.FindObjectsByType<DetonatorExplosion>(FindObjectsSortMode.None))
+            {
+                if (det == null) continue;
+                result.Add(new DetonatorState
+                {
+                    DetonatorId = det.DetonatorID,
+                    State = det.HasExploded() ? 2 : det.HasPurchased() ? 1 : 0,
+                    SaveData = det.GetCustomSaveData()
+                });
+            }
+            return result;
+        }
+
+        private List<DetonatorState> BuildDirtyDetonators(HashSet<int> dirtyIds)
+        {
+            var result = new List<DetonatorState>();
+            if (dirtyIds.Count == 0) return result;
+
+            foreach (var det in UnityEngine.Object.FindObjectsByType<DetonatorExplosion>(FindObjectsSortMode.None))
+            {
+                if (det == null) continue;
+                if (!dirtyIds.Contains(det.DetonatorID)) continue;
+                result.Add(new DetonatorState
+                {
+                    DetonatorId = det.DetonatorID,
+                    State = det.HasExploded() ? 2 : det.HasPurchased() ? 1 : 0,
+                    SaveData = det.GetCustomSaveData()
+                });
+            }
+            return result;
+        }
+
+        private void ApplyDetonatorStates(List<DetonatorState> detonators)
+        {
+            if (detonators == null || detonators.Count == 0) return;
+
+            var lookup = new Dictionary<int, DetonatorState>();
+            foreach (var ds in detonators) lookup[ds.DetonatorId] = ds;
+
+            foreach (var det in UnityEngine.Object.FindObjectsByType<DetonatorExplosion>(FindObjectsSortMode.None))
+            {
+                if (det == null) continue;
+                if (!lookup.TryGetValue(det.DetonatorID, out var state)) continue;
+
+                _log.LogInfo($"[Session] Applying detonator {det.DetonatorID} state={state.State}");
+
+                // Use the game's own save/load mechanism to restore the full state,
+                // which handles disabling walls, showing/hiding TNT, and setting the enum.
+                if (!string.IsNullOrEmpty(state.SaveData))
+                {
+                    BuildingInteractionPatch.NetworkBypass = true;
+                    try { det.LoadFromSave(state.SaveData); }
+                    finally { BuildingInteractionPatch.NetworkBypass = false; }
+                }
+            }
         }
 
         // ── Client RPC helpers (called from patches) ─
@@ -4306,18 +4765,28 @@ namespace MineMogulMultiplayer.Core
                 _net.SendToAll(MessageType.CratePositionBatch, _poolCratePositionUpdates);
         }
 
-        /// <summary>Client: apply crate position updates from host.</summary>
+        /// <summary>Client: apply crate position updates from host using smooth interpolation.</summary>
         private void ApplyCratePositionUpdates(List<CratePositionUpdate> updates)
         {
             if (updates == null) return;
             foreach (var upd in updates)
             {
+                // Skip crates the client is actively holding — don't let host override local grab
+                if (_clientLocallyHeldCrates.Contains(upd.NetworkId)) continue;
+
                 if (_clientCrateByNetId.TryGetValue(upd.NetworkId, out var crate) && crate != null)
                 {
-                    crate.transform.position = upd.Position.ToUnity();
-                    crate.transform.rotation = upd.Rotation.ToUnity();
+                    // Set interpolation targets instead of snapping
+                    _crateTargetPositions[upd.NetworkId] = upd.Position.ToUnity();
+                    _crateTargetRotations[upd.NetworkId] = upd.Rotation.ToUnity();
                     var rb = crate.GetComponent<Rigidbody>();
-                    if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
+                    if (rb != null)
+                    {
+                        rb.isKinematic = true;
+                        rb.linearVelocity = Vector3.zero;
+                        rb.angularVelocity = Vector3.zero;
+                    }
+                    _remotelyHeldCrates[upd.NetworkId] = UnityEngine.Time.unscaledTime;
                 }
             }
         }
@@ -4358,6 +4827,224 @@ namespace MineMogulMultiplayer.Core
                     rb.isKinematic = true;
                     rb.linearVelocity = Vector3.zero;
                     rb.angularVelocity = Vector3.zero;
+                }
+                _remotelyHeldCrates[upd.NetworkId] = UnityEngine.Time.unscaledTime;
+            }
+        }
+
+        // ── Item drop/throw sync ──────────────────────
+
+        /// <summary>Track previously held object to detect drops.</summary>
+        private string _prevHeldObjectId;
+        private Vector3 _prevHeldObjectPos;
+
+        /// <summary>
+        /// Detect when the local player drops/throws a held item and send velocity info
+        /// so other clients see the item fly correctly.
+        /// </summary>
+        public void DetectAndSendItemDrop(PlayerController pc)
+        {
+            if (_net == null || !_net.IsRunning) return;
+
+            string currentHeld = null;
+            try
+            {
+                var heldObj = pc?.HeldObject;
+                if (heldObj != null)
+                {
+                    currentHeld = TryGetHeldObjectFallbackId(heldObj);
+                    if (string.IsNullOrEmpty(currentHeld))
+                        currentHeld = heldObj.name?.Replace("(Clone)", "").Trim();
+                }
+            }
+            catch { }
+
+            // Detect transition from holding to not holding
+            if (!string.IsNullOrEmpty(_prevHeldObjectId) && string.IsNullOrEmpty(currentHeld))
+            {
+                // Item was dropped - find it and send velocity
+                TrySendDropVelocity(_prevHeldObjectId, _prevHeldObjectPos);
+            }
+
+            _prevHeldObjectId = currentHeld;
+            if (!string.IsNullOrEmpty(currentHeld))
+            {
+                try { _prevHeldObjectPos = pc.HeldObject.transform.position; } catch { }
+            }
+        }
+
+        private void TrySendDropVelocity(string itemId, Vector3 lastKnownPos)
+        {
+            // Search for the recently-dropped item near the last known position
+            float searchRadius = 5f;
+
+            // Check ores
+            if (MultiplayerState.IsClient)
+            {
+                foreach (var kv in _clientOreByNetId)
+                {
+                    var ore = kv.Value;
+                    if (ore == null) continue;
+                    if (Vector3.SqrMagnitude(ore.transform.position - lastKnownPos) > searchRadius * searchRadius) continue;
+                    var rb = ore.GetComponent<Rigidbody>();
+                    if (rb == null) continue;
+                    SendItemDropMessage("ore", kv.Key, ore.transform, rb);
+                    return;
+                }
+                foreach (var kv in _clientCrateByNetId)
+                {
+                    var crate = kv.Value;
+                    if (crate == null) continue;
+                    if (Vector3.SqrMagnitude(crate.transform.position - lastKnownPos) > searchRadius * searchRadius) continue;
+                    var rb = crate.GetComponent<Rigidbody>();
+                    if (rb == null) continue;
+                    SendItemDropMessage("crate", kv.Key, crate.transform, rb);
+                    return;
+                }
+            }
+            else if (MultiplayerState.IsHost)
+            {
+                // Host: check ores near drop position
+                foreach (var ore in OrePiece.AllOrePieces)
+                {
+                    if (ore == null) continue;
+                    if (Vector3.SqrMagnitude(ore.transform.position - lastKnownPos) > searchRadius * searchRadius) continue;
+                    if (!_hostOreInstanceToNetId.TryGetValue(ore.GetInstanceID(), out int netId)) continue;
+                    var rb = ore.GetComponent<Rigidbody>();
+                    if (rb == null) continue;
+                    SendItemDropMessage("ore", netId, ore.transform, rb);
+                    return;
+                }
+                // Host: check crates
+                var allCrates = UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None);
+                foreach (var crate in allCrates)
+                {
+                    if (crate == null) continue;
+                    if (Vector3.SqrMagnitude(crate.transform.position - lastKnownPos) > searchRadius * searchRadius) continue;
+                    if (!_hostCrateInstanceToNetId.TryGetValue(crate.GetInstanceID(), out int netId)) continue;
+                    var rb = crate.GetComponent<Rigidbody>();
+                    if (rb == null) continue;
+                    SendItemDropMessage("crate", netId, crate.transform, rb);
+                    return;
+                }
+            }
+        }
+
+        private void SendItemDropMessage(string itemType, int netId, Transform t, Rigidbody rb)
+        {
+            var msg = new ItemDroppedMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                ItemType = itemType,
+                NetworkId = netId,
+                Position = new NetVector3(t.position),
+                Rotation = new NetQuaternion(t.rotation),
+                Velocity = new NetVector3(rb.linearVelocity),
+                AngularVelocity = new NetVector3(rb.angularVelocity)
+            };
+
+            if (MultiplayerState.IsHost)
+                _net.SendToAll(MessageType.ItemDropped, msg);
+            else
+                _net.SendToHost(MessageType.ItemDropped, msg);
+        }
+
+        /// <summary>Host: receive drop from client, apply physics, broadcast to all.</summary>
+        private void HandleItemDropped(uint clientId, ItemDroppedMessage msg)
+        {
+            if (msg.ItemType == "ore")
+            {
+                // Find host ore by netId
+                foreach (var kv in _hostOreInstanceToNetId)
+                {
+                    if (kv.Value != msg.NetworkId) continue;
+                    foreach (var ore in OrePiece.AllOrePieces)
+                    {
+                        if (ore != null && ore.GetInstanceID() == kv.Key)
+                        {
+                            var rb = ore.GetComponent<Rigidbody>();
+                            if (rb != null)
+                            {
+                                rb.isKinematic = false;
+                                rb.linearVelocity = msg.Velocity.ToUnity();
+                                rb.angularVelocity = msg.AngularVelocity.ToUnity();
+                            }
+                            _remotelyHeldOres.Remove(msg.NetworkId);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            else if (msg.ItemType == "crate")
+            {
+                foreach (var kv in _hostCrateInstanceToNetId)
+                {
+                    if (kv.Value != msg.NetworkId) continue;
+                    var allCrates = UnityEngine.Object.FindObjectsByType<BreakableCrate>(FindObjectsSortMode.None);
+                    foreach (var crate in allCrates)
+                    {
+                        if (crate != null && crate.GetInstanceID() == kv.Key)
+                        {
+                            var rb = crate.GetComponent<Rigidbody>();
+                            if (rb != null)
+                            {
+                                rb.isKinematic = false;
+                                rb.linearVelocity = msg.Velocity.ToUnity();
+                                rb.angularVelocity = msg.AngularVelocity.ToUnity();
+                            }
+                            _remotelyHeldCrates.Remove(msg.NetworkId);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Broadcast to all clients
+            _net.SendToAll(MessageType.ItemDropped, msg);
+        }
+
+        /// <summary>Client: apply item drop velocity from host broadcast.</summary>
+        private void ApplyItemDropped(ItemDroppedMessage msg)
+        {
+            // Don't apply our own drops
+            if (msg.PlayerId == MultiplayerState.LocalPlayerId) return;
+
+            if (msg.ItemType == "ore")
+            {
+                if (_clientOreByNetId.TryGetValue(msg.NetworkId, out var ore) && ore != null)
+                {
+                    ore.transform.position = msg.Position.ToUnity();
+                    ore.transform.rotation = msg.Rotation.ToUnity();
+                    var rb = ore.GetComponent<Rigidbody>();
+                    if (rb != null)
+                    {
+                        rb.isKinematic = false;
+                        rb.linearVelocity = msg.Velocity.ToUnity();
+                        rb.angularVelocity = msg.AngularVelocity.ToUnity();
+                    }
+                    _remotelyHeldOres.Remove(msg.NetworkId);
+                    _oreTargetPositions.Remove(msg.NetworkId);
+                    _oreTargetRotations.Remove(msg.NetworkId);
+                }
+            }
+            else if (msg.ItemType == "crate")
+            {
+                if (_clientCrateByNetId.TryGetValue(msg.NetworkId, out var crate) && crate != null)
+                {
+                    crate.transform.position = msg.Position.ToUnity();
+                    crate.transform.rotation = msg.Rotation.ToUnity();
+                    var rb = crate.GetComponent<Rigidbody>();
+                    if (rb != null)
+                    {
+                        rb.isKinematic = false;
+                        rb.linearVelocity = msg.Velocity.ToUnity();
+                        rb.angularVelocity = msg.AngularVelocity.ToUnity();
+                    }
+                    _remotelyHeldCrates.Remove(msg.NetworkId);
+                    _crateTargetPositions.Remove(msg.NetworkId);
+                    _crateTargetRotations.Remove(msg.NetworkId);
                 }
             }
         }
@@ -4712,9 +5399,21 @@ namespace MineMogulMultiplayer.Core
             _clientOreByNetId.Clear();
             _lastSentOrePositions.Clear();
             _clientLastSentOrePos.Clear();
+            _clientLastSentCratePos.Clear();
+            _clientLocallyHeldCrates.Clear();
+            _oreTargetPositions.Clear();
+            _oreTargetRotations.Clear();
+            _crateTargetPositions.Clear();
+            _crateTargetRotations.Clear();
+            _remotelyHeldOres.Clear();
+            _remotelyHeldCrates.Clear();
+            _prevHeldObjectId = null;
             _lastValidToolName = null;
             _toolNullTicks = 0;
             _nextOreNetId = 1;
+            _savedPlayerInventories.Clear();
+            _clientSteamIds.Clear();
+            _hostSaveFilePath = null;
             LobbyPlayerNames.Clear();
             RemotePlayerManager.Clear();
             _log.LogInfo("[Session] Stopped");

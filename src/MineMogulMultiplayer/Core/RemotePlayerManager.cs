@@ -30,6 +30,8 @@ namespace MineMogulMultiplayer.Core
             public string CurrentToolId;     // SavableObjectID name, or null
             public GameObject HeldWorldGo;   // world-space visual for physics-held object
             public string CurrentHeldWorldId;
+            public Vector3 HeldWorldTargetPos;  // interpolation target for held world object
+            public Quaternion HeldWorldTargetRot;
             public MinerWalkAnim Anim;       // walk animation component (for arm pose)
             public int ToolNullTicks;        // client-side debounce counter for empty tool
             public bool IsCrouching;
@@ -119,7 +121,8 @@ namespace MineMogulMultiplayer.Core
 
                 // If the remote player is physically holding a world object (lantern/tool),
                 // render a world-space proxy so everyone sees it moving around the map.
-                if (!string.IsNullOrEmpty(heldWorldId))
+                // Skip crates – they are already position-synced as real game objects.
+                if (!string.IsNullOrEmpty(heldWorldId) && !IsPhysicsHoldable(heldWorldId))
                 {
                     if (rp.HeldWorldGo == null || rp.CurrentHeldWorldId != heldWorldId)
                     {
@@ -129,8 +132,14 @@ namespace MineMogulMultiplayer.Core
                     }
                     if (rp.HeldWorldGo != null)
                     {
-                        rp.HeldWorldGo.transform.position = ps.HeldObjectPosition.ToUnity();
-                        rp.HeldWorldGo.transform.rotation = ps.HeldObjectRotation.ToUnity();
+                        rp.HeldWorldTargetPos = ps.HeldObjectPosition.ToUnity();
+                        rp.HeldWorldTargetRot = ps.HeldObjectRotation.ToUnity();
+                        // Snap on first frame (newly created)
+                        if (rp.CurrentHeldWorldId != heldWorldId)
+                        {
+                            rp.HeldWorldGo.transform.position = rp.HeldWorldTargetPos;
+                            rp.HeldWorldGo.transform.rotation = rp.HeldWorldTargetRot;
+                        }
                     }
                 }
                 else
@@ -176,12 +185,20 @@ namespace MineMogulMultiplayer.Core
         public static void Interpolate()
         {
             float dt = Time.deltaTime;
+            float t = InterpolationSpeed * dt;
             foreach (var kv in _remotePlayers)
             {
                 var rp = kv.Value;
                 if (rp.Go == null) continue;
-                rp.Go.transform.position = Vector3.Lerp(rp.Go.transform.position, rp.TargetPosition, InterpolationSpeed * dt);
-                rp.Go.transform.rotation = Quaternion.Slerp(rp.Go.transform.rotation, rp.TargetRotation, InterpolationSpeed * dt);
+                rp.Go.transform.position = Vector3.Lerp(rp.Go.transform.position, rp.TargetPosition, t);
+                rp.Go.transform.rotation = Quaternion.Slerp(rp.Go.transform.rotation, rp.TargetRotation, t);
+
+                // Smooth held world object movement
+                if (rp.HeldWorldGo != null)
+                {
+                    rp.HeldWorldGo.transform.position = Vector3.Lerp(rp.HeldWorldGo.transform.position, rp.HeldWorldTargetPos, t);
+                    rp.HeldWorldGo.transform.rotation = Quaternion.Slerp(rp.HeldWorldGo.transform.rotation, rp.HeldWorldTargetRot, t);
+                }
             }
         }
 

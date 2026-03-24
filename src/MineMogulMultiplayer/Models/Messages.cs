@@ -38,8 +38,10 @@ namespace MineMogulMultiplayer.Models
         OrePositionBatch = 36,
         InventorySync    = 37,
         CratePositionBatch = 38,
+        ItemDropped      = 39,
         ChatMessage      = 40,
         ShopPurchaseNotify = 41,
+        ClientInventoryReport = 42,
 
         // Lobby flow
         LobbyLaunch      = 50,
@@ -138,6 +140,7 @@ namespace MineMogulMultiplayer.Models
     {
         [Key(0)] public string PlayerName;
         [Key(1)] public string ModVersion;
+        [Key(2)] public ulong SteamId;
     }
 
     [MessagePackObject]
@@ -205,5 +208,33 @@ namespace MineMogulMultiplayer.Models
         [Key(0)] public string[] PurchasedTools;
         /// <summary>Total money spent (so host can deduct).</summary>
         [Key(1)] public float TotalCost;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Item drop/throw notification (bidirectional)
+    // ──────────────────────────────────────────────
+
+    [MessagePackObject]
+    public class ItemDroppedMessage
+    {
+        [Key(0)] public int PlayerId;
+        /// <summary>"ore" or "crate"</summary>
+        [Key(1)] public string ItemType;
+        [Key(2)] public int NetworkId;
+        [Key(3)] public NetVector3 Position;
+        [Key(4)] public NetQuaternion Rotation;
+        [Key(5)] public NetVector3 Velocity;
+        [Key(6)] public NetVector3 AngularVelocity;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Client inventory report (client → host, periodic)
+    // ──────────────────────────────────────────────
+
+    [MessagePackObject]
+    public class ClientInventoryReportMessage
+    {
+        [Key(0)] public ulong SteamId;
+        [Key(1)] public string[] Tools;
     }
 }

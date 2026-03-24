@@ -171,6 +171,21 @@ namespace MineMogulMultiplayer.Models
     }
 
     // ──────────────────────────────────────────────
+    //  Detonator / world-event state
+    // ──────────────────────────────────────────────
+
+    [MessagePackObject]
+    public class DetonatorState
+    {
+        /// <summary>DetonatorExplosion.DetonatorID — unique per detonator in the scene.</summary>
+        [Key(0)] public int DetonatorId;
+        /// <summary>0 = Available, 1 = Purchased, 2 = Exploded.</summary>
+        [Key(1)] public int State;
+        /// <summary>JSON from GetCustomSaveData() for full restore.</summary>
+        [Key(2)] public string SaveData;
+    }
+
+    // ──────────────────────────────────────────────
     //  Contract state tracking
     // ──────────────────────────────────────────────
 

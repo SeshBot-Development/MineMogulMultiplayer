@@ -35,5 +35,21 @@ namespace MineMogulMultiplayer.Patches
             _log?.LogWarning("[SaveSystemPatch] Blocked client save attempt during multiplayer");
             return false;
         }
+
+        /// <summary>After the host saves, also save multiplayer companion data (player inventories).</summary>
+        [HarmonyPatch(typeof(SavingLoadingManager), "SaveGame")]
+        [HarmonyPostfix]
+        public static void Postfix_SaveGame()
+        {
+            if (!MultiplayerState.IsOnline || !MultiplayerState.IsHost) return;
+            try
+            {
+                SessionManager.Instance?.SaveMultiplayerCompanionData();
+            }
+            catch (System.Exception ex)
+            {
+                _log?.LogError($"[SaveSystemPatch] Failed to save companion data: {ex}");
+            }
+        }
     }
 }

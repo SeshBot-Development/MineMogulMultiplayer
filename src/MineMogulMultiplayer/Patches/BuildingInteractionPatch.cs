@@ -154,5 +154,26 @@ namespace MineMogulMultiplayer.Patches
                     new NetVector3(__instance.transform.position), "buyDetonator");
             return false;
         }
+
+        // ── DetonatorExplosion.Explode — fires when explosion actually happens ──
+
+        [HarmonyPatch(typeof(DetonatorExplosion), "Explode")]
+        [HarmonyPostfix]
+        public static void Postfix_DetonatorExplosion_Explode(DetonatorExplosion __instance)
+        {
+            if (!MultiplayerState.IsHost || NetworkBypass) return;
+            DirtyTracker.DirtyDetonatorIds.Add(__instance.DetonatorID);
+        }
+
+        // ── DetonatorExplosion.PurchaseTNT — fires when TNT is purchased ──
+
+        [HarmonyPatch(typeof(DetonatorExplosion), "PurchaseTNT")]
+        [HarmonyPostfix]
+        public static void Postfix_DetonatorExplosion_PurchaseTNT(DetonatorExplosion __instance)
+        {
+            if (!MultiplayerState.IsHost || NetworkBypass) return;
+            DirtyTracker.DirtyDetonatorIds.Add(__instance.DetonatorID);
+            DirtyTracker.MoneyDirty = true;
+        }
     }
 }

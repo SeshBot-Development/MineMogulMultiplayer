@@ -26,6 +26,9 @@ namespace MineMogulMultiplayer.Core
         // Set of ore InstanceIDs known from last tick (for diff detection)
         public static readonly HashSet<int> KnownOreIds = new HashSet<int>();
 
+        // Detonators whose state changed this tick (keyed by DetonatorID)
+        public static readonly HashSet<int> DirtyDetonatorIds = new HashSet<int>();
+
         public static void Reset()
         {
             MoneyDirty = false;
@@ -39,6 +42,7 @@ namespace MineMogulMultiplayer.Core
             DirtyBeltIds.Clear();
             SpawnedOrePieces.Clear();
             RemovedOrePieceIds.Clear();
+            DirtyDetonatorIds.Clear();
         }
     }
 }

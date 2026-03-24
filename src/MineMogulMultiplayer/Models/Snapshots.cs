@@ -21,6 +21,9 @@ namespace MineMogulMultiplayer.Models
 
         /// <summary>All breakable crate positions (synced on join so clients see correct crate layout).</summary>
         [Key(6)] public List<CrateState> Crates;
+
+        /// <summary>State of all detonator explosions (doors/barriers blown open).</summary>
+        [Key(7)] public List<DetonatorState> Detonators;
     }
 
     // ──────────────────────────────────────────────
@@ -52,6 +55,9 @@ namespace MineMogulMultiplayer.Models
 
         /// <summary>Conveyor belt states that changed.</summary>
         [Key(7)] public List<ConveyorState> ChangedConveyors;
+
+        /// <summary>Detonators whose state changed (purchased or exploded).</summary>
+        [Key(8)] public List<DetonatorState> ChangedDetonators;
     }
 
     // ──────────────────────────────────────────────
