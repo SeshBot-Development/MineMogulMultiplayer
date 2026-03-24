@@ -42,6 +42,7 @@ namespace MineMogulMultiplayer.Models
         ChatMessage      = 40,
         ShopPurchaseNotify = 41,
         ClientInventoryReport = 42,
+        SoundEvent = 43,
 
         // Lobby flow
         LobbyLaunch      = 50,
@@ -236,5 +237,18 @@ namespace MineMogulMultiplayer.Models
     {
         [Key(0)] public ulong SteamId;
         [Key(1)] public string[] Tools;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Sound event (bidirectional, spatial audio sync)
+    // ──────────────────────────────────────────────
+
+    [MessagePackObject]
+    public class SoundEventMessage
+    {
+        [Key(0)] public int PlayerId;
+        /// <summary>SoundDefinition name/identifier.</summary>
+        [Key(1)] public string SoundName;
+        [Key(2)] public NetVector3 Position;
     }
 }

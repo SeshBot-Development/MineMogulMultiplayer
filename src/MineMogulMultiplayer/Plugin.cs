@@ -51,6 +51,9 @@ namespace MineMogulMultiplayer
 
             // Config
             _cfgPlayerName = Config.Bind("Network", "PlayerName", "Player", "Display name in multiplayer.");
+            // If the config is still the default "Player", use the Steam display name instead
+            if (_cfgPlayerName.Value == "Player" && !string.IsNullOrEmpty(SteamClient.Name))
+                _cfgPlayerName.Value = SteamClient.Name;
             _cfgTickRate = Config.Bind("Network", "TickRate", 20, "State updates per second (host only).");
 
             _tickInterval = 1f / _cfgTickRate.Value;
@@ -96,6 +99,7 @@ namespace MineMogulMultiplayer
             OreManagerPatch.Init(Logger);
             BuildingInteractionPatch.Init(Logger);
             SaveSystemPatch.Init(Logger);
+            SoundPatch.Init(Logger);
             RemotePlayerManager.Init(Logger);
 
             Logger.LogInfo($"{Core.PluginInfo.Name} v{Core.PluginInfo.Version} loaded");

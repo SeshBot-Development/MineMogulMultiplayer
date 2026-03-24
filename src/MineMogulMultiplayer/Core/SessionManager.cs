@@ -816,6 +816,9 @@ namespace MineMogulMultiplayer.Core
             // Destroy stale remote player visuals from previous scene
             RemotePlayerManager.Clear();
 
+            // Invalidate sound cache for new scene
+            Patches.SoundPatch.InvalidateCache();
+
             if (_pendingHost)
             {
                 // Scene finished loading — start P2P and finalize host startup
@@ -1062,11 +1065,9 @@ namespace MineMogulMultiplayer.Core
                 _net.SendToAll(MessageType.OreRemovedBatch, _poolRemovedOreIds);
 
             // Periodically send position updates for ores that have moved significantly
-            if (_tick % OrePositionSyncInterval == 0)
-            {
-                SendOrePositionUpdates();
-                SendCratePositionUpdates();
-            }
+            // Send every tick for smoother movement (was every 2 ticks)
+            SendOrePositionUpdates();
+            SendCratePositionUpdates();
 
             // Release ores that haven't been remotely updated recently
             ReleaseStaleRemoteOres();
@@ -1470,40 +1471,43 @@ namespace MineMogulMultiplayer.Core
 
             // Send position update every other tick (~10 times/sec at 20 tps)
             _tick++;
-            if (_tick % 2 != 0) return;
 
+            // Send ore/crate position updates every tick for smoother held-item sync
             if (_net != null && _net.IsRunning)
             {
                 if (TryGetLocalPlayerPose(out var pos, out var rot, out var pc))
                 {
-                    string heldId = null;
-                    var heldPos = default(NetVector3);
-                    var heldRot = default(NetQuaternion);
-                    if (pc != null)
-                        TryGetHeldObjectState(pc, out heldId, out heldPos, out heldRot);
-
-                    _net.SendToHost(MessageType.PlayerInput, new PlayerInputMessage
-                    {
-                        PlayerId = MultiplayerState.LocalPlayerId,
-                        Position = new NetVector3(pos),
-                        Rotation = new NetQuaternion(rot),
-                        Sprinting = pc != null && GetSprintState(pc),
-                        ClientTick = _tick,
-                        EquippedTool = pc != null ? GetEquippedToolName(pc) : _lastValidToolName,
-                        IsCrouching = pc != null && GetCrouchState(pc),
-                        HeldObjectId = heldId,
-                        HeldObjectPosition = heldPos,
-                        HeldObjectRotation = heldRot
-                    });
-
-                    // Send position updates for ores the client is holding/moving
                     if (pc != null)
                     {
                         SendClientOrePositions(pc);
                         DetectAndSendItemDrop(pc);
                     }
+
+                    // Send player input at half rate (every 2 ticks)
+                    if (_tick % 2 == 0)
+                    {
+                        string heldId = null;
+                        var heldPos = default(NetVector3);
+                        var heldRot = default(NetQuaternion);
+                        if (pc != null)
+                            TryGetHeldObjectState(pc, out heldId, out heldPos, out heldRot);
+
+                        _net.SendToHost(MessageType.PlayerInput, new PlayerInputMessage
+                        {
+                            PlayerId = MultiplayerState.LocalPlayerId,
+                            Position = new NetVector3(pos),
+                            Rotation = new NetQuaternion(rot),
+                            Sprinting = pc != null && GetSprintState(pc),
+                            ClientTick = _tick,
+                            EquippedTool = pc != null ? GetEquippedToolName(pc) : _lastValidToolName,
+                            IsCrouching = pc != null && GetCrouchState(pc),
+                            HeldObjectId = heldId,
+                            HeldObjectPosition = heldPos,
+                            HeldObjectRotation = heldRot
+                        });
+                    }
                 }
-                else if (_tick % 40 == 0) // Log every 2 seconds if controller is missing
+                else if (_tick % 40 == 0)
                 {
                     _log.LogWarning("[Session] Local player transform not found — cannot send position");
                 }
@@ -1593,6 +1597,35 @@ namespace MineMogulMultiplayer.Core
 
             if (_clientOreUpdatePool.Count > 0)
                 _net.SendToHost(MessageType.OrePositionBatch, _clientOreUpdatePool);
+
+            // Check for magnet-held or hand-held crates too
+            foreach (var kv in _clientCrateByNetId)
+            {
+                var crate = kv.Value;
+                if (crate == null) continue;
+                float sqrDist = Vector3.SqrMagnitude(crate.transform.position - playerPos);
+
+                // Check for any joint component (magnet/physics grab)
+                if (sqrDist < 225f) // 15m
+                {
+                    var joint = crate.GetComponent<Joint>();
+                    if (joint != null)
+                    {
+                        TryAddClientCrateUpdate(crate);
+                        continue;
+                    }
+                }
+
+                // If magnet equipped, detect crates with velocity within range
+                if (hasMagnet && sqrDist < 100f) // 10m
+                {
+                    var rb = crate.GetComponent<Rigidbody>();
+                    if (rb != null && !rb.isKinematic && rb.linearVelocity.sqrMagnitude > 0.25f)
+                    {
+                        TryAddClientCrateUpdate(crate);
+                    }
+                }
+            }
 
             // Send crate position updates
             if (_clientCrateUpdatePool.Count > 0)
@@ -2448,6 +2481,10 @@ namespace MineMogulMultiplayer.Core
                         var invReport = NetSerializer.Deserialize<ClientInventoryReportMessage>(payload);
                         HandleClientInventoryReport(clientId, invReport);
                         break;
+                    case MessageType.SoundEvent:
+                        var hostSoundMsg = NetSerializer.Deserialize<SoundEventMessage>(payload);
+                        HandleSoundEventFromClient(clientId, hostSoundMsg);
+                        break;
                 }
             }
             catch (Exception ex)
@@ -2562,6 +2599,10 @@ namespace MineMogulMultiplayer.Core
                         if (_clientWaitingForSnapshot) break;
                         var clientDropMsg = NetSerializer.Deserialize<ItemDroppedMessage>(payload);
                         ApplyItemDropped(clientDropMsg);
+                        break;
+                    case MessageType.SoundEvent:
+                        var clientSoundMsg = NetSerializer.Deserialize<SoundEventMessage>(payload);
+                        HandleSoundEventOnClient(clientSoundMsg);
                         break;
                 }
             }
@@ -3851,11 +3892,17 @@ namespace MineMogulMultiplayer.Core
 
                 if (_clientOreByNetId.TryGetValue(upd.NetworkId, out var ore) && ore != null)
                 {
-                    // Set interpolation targets instead of snapping.
-                    // Do NOT set kinematic here — these are general position corrections,
-                    // not "held by remote player." Kinematic ores can't be picked up.
                     _oreTargetPositions[upd.NetworkId] = upd.Position.ToUnity();
                     _oreTargetRotations[upd.NetworkId] = upd.Rotation.ToUnity();
+                    // Make kinematic while being remotely moved so physics doesn't fight interpolation
+                    var rb = ore.GetComponent<Rigidbody>();
+                    if (rb != null)
+                    {
+                        rb.isKinematic = true;
+                        rb.linearVelocity = Vector3.zero;
+                        rb.angularVelocity = Vector3.zero;
+                    }
+                    _remotelyHeldOres[upd.NetworkId] = UnityEngine.Time.unscaledTime;
                 }
             }
         }
@@ -4837,6 +4884,9 @@ namespace MineMogulMultiplayer.Core
         /// <summary>Track previously held object to detect drops.</summary>
         private string _prevHeldObjectId;
         private Vector3 _prevHeldObjectPos;
+        private Vector3 _prevHeldObjectPosOlder; // position from frame before _prevHeldObjectPos
+        private Vector3 _prevHeldObjectVelocity; // cached velocity while still held (for throw detection)
+        private Rigidbody _prevHeldObjectRb; // cached rigidbody for velocity tracking
 
         /// <summary>
         /// Detect when the local player drops/throws a held item and send velocity info
@@ -4847,6 +4897,7 @@ namespace MineMogulMultiplayer.Core
             if (_net == null || !_net.IsRunning) return;
 
             string currentHeld = null;
+            Rigidbody currentRb = null;
             try
             {
                 var heldObj = pc?.HeldObject;
@@ -4855,6 +4906,7 @@ namespace MineMogulMultiplayer.Core
                     currentHeld = TryGetHeldObjectFallbackId(heldObj);
                     if (string.IsNullOrEmpty(currentHeld))
                         currentHeld = heldObj.name?.Replace("(Clone)", "").Trim();
+                    currentRb = heldObj.GetComponent<Rigidbody>();
                 }
             }
             catch { }
@@ -4862,18 +4914,47 @@ namespace MineMogulMultiplayer.Core
             // Detect transition from holding to not holding
             if (!string.IsNullOrEmpty(_prevHeldObjectId) && string.IsNullOrEmpty(currentHeld))
             {
-                // Item was dropped - find it and send velocity
-                TrySendDropVelocity(_prevHeldObjectId, _prevHeldObjectPos);
+                // Item was dropped - find it and send with cached velocity
+                TrySendDropVelocity(_prevHeldObjectId, _prevHeldObjectPos, _prevHeldObjectVelocity);
             }
 
             _prevHeldObjectId = currentHeld;
             if (!string.IsNullOrEmpty(currentHeld))
             {
-                try { _prevHeldObjectPos = pc.HeldObject.transform.position; } catch { }
+                Vector3 newPos = Vector3.zero;
+                try { newPos = pc.HeldObject.transform.position; } catch { }
+
+                // Cache velocity while still being held
+                if (_prevHeldObjectRb != currentRb && currentRb != null)
+                    _prevHeldObjectVelocity = Vector3.zero;
+                _prevHeldObjectRb = currentRb;
+
+                if (currentRb != null && !currentRb.isKinematic)
+                {
+                    _prevHeldObjectVelocity = currentRb.linearVelocity;
+                }
+                else
+                {
+                    // Estimate velocity from position delta (for kinematic held objects)
+                    float dt = UnityEngine.Time.deltaTime;
+                    if (dt > 0.001f && _prevHeldObjectPos != Vector3.zero)
+                    {
+                        var estimatedVel = (newPos - _prevHeldObjectPos) / dt;
+                        _prevHeldObjectVelocity = Vector3.Lerp(_prevHeldObjectVelocity, estimatedVel, 0.5f);
+                    }
+                }
+
+                _prevHeldObjectPosOlder = _prevHeldObjectPos;
+                _prevHeldObjectPos = newPos;
+            }
+            else
+            {
+                _prevHeldObjectVelocity = Vector3.zero;
+                _prevHeldObjectRb = null;
             }
         }
 
-        private void TrySendDropVelocity(string itemId, Vector3 lastKnownPos)
+        private void TrySendDropVelocity(string itemId, Vector3 lastKnownPos, Vector3 cachedVelocity)
         {
             // Search for the recently-dropped item near the last known position
             float searchRadius = 5f;
@@ -4888,7 +4969,7 @@ namespace MineMogulMultiplayer.Core
                     if (Vector3.SqrMagnitude(ore.transform.position - lastKnownPos) > searchRadius * searchRadius) continue;
                     var rb = ore.GetComponent<Rigidbody>();
                     if (rb == null) continue;
-                    SendItemDropMessage("ore", kv.Key, ore.transform, rb);
+                    SendItemDropMessage("ore", kv.Key, ore.transform, rb, cachedVelocity);
                     return;
                 }
                 foreach (var kv in _clientCrateByNetId)
@@ -4898,7 +4979,7 @@ namespace MineMogulMultiplayer.Core
                     if (Vector3.SqrMagnitude(crate.transform.position - lastKnownPos) > searchRadius * searchRadius) continue;
                     var rb = crate.GetComponent<Rigidbody>();
                     if (rb == null) continue;
-                    SendItemDropMessage("crate", kv.Key, crate.transform, rb);
+                    SendItemDropMessage("crate", kv.Key, crate.transform, rb, cachedVelocity);
                     return;
                 }
             }
@@ -4912,7 +4993,7 @@ namespace MineMogulMultiplayer.Core
                     if (!_hostOreInstanceToNetId.TryGetValue(ore.GetInstanceID(), out int netId)) continue;
                     var rb = ore.GetComponent<Rigidbody>();
                     if (rb == null) continue;
-                    SendItemDropMessage("ore", netId, ore.transform, rb);
+                    SendItemDropMessage("ore", netId, ore.transform, rb, cachedVelocity);
                     return;
                 }
                 // Host: check crates
@@ -4924,14 +5005,19 @@ namespace MineMogulMultiplayer.Core
                     if (!_hostCrateInstanceToNetId.TryGetValue(crate.GetInstanceID(), out int netId)) continue;
                     var rb = crate.GetComponent<Rigidbody>();
                     if (rb == null) continue;
-                    SendItemDropMessage("crate", netId, crate.transform, rb);
+                    SendItemDropMessage("crate", netId, crate.transform, rb, cachedVelocity);
                     return;
                 }
             }
         }
 
-        private void SendItemDropMessage(string itemType, int netId, Transform t, Rigidbody rb)
+        private void SendItemDropMessage(string itemType, int netId, Transform t, Rigidbody rb, Vector3 cachedVelocity)
         {
+            // Use the actual rb velocity if available, otherwise fall back to cached
+            var vel = rb.linearVelocity;
+            if (vel.sqrMagnitude < 0.01f && cachedVelocity.sqrMagnitude > 0.01f)
+                vel = cachedVelocity;
+
             var msg = new ItemDroppedMessage
             {
                 PlayerId = MultiplayerState.LocalPlayerId,
@@ -4939,9 +5025,12 @@ namespace MineMogulMultiplayer.Core
                 NetworkId = netId,
                 Position = new NetVector3(t.position),
                 Rotation = new NetQuaternion(t.rotation),
-                Velocity = new NetVector3(rb.linearVelocity),
+                Velocity = new NetVector3(vel),
                 AngularVelocity = new NetVector3(rb.angularVelocity)
             };
+
+            // Ensure the item is non-kinematic locally so it responds to physics
+            rb.isKinematic = false;
 
             if (MultiplayerState.IsHost)
                 _net.SendToAll(MessageType.ItemDropped, msg);
@@ -4954,7 +5043,6 @@ namespace MineMogulMultiplayer.Core
         {
             if (msg.ItemType == "ore")
             {
-                // Find host ore by netId
                 foreach (var kv in _hostOreInstanceToNetId)
                 {
                     if (kv.Value != msg.NetworkId) continue;
@@ -4962,6 +5050,9 @@ namespace MineMogulMultiplayer.Core
                     {
                         if (ore != null && ore.GetInstanceID() == kv.Key)
                         {
+                            // Apply position first so velocity starts from correct place
+                            ore.transform.position = msg.Position.ToUnity();
+                            ore.transform.rotation = msg.Rotation.ToUnity();
                             var rb = ore.GetComponent<Rigidbody>();
                             if (rb != null)
                             {
@@ -4986,6 +5077,8 @@ namespace MineMogulMultiplayer.Core
                     {
                         if (crate != null && crate.GetInstanceID() == kv.Key)
                         {
+                            crate.transform.position = msg.Position.ToUnity();
+                            crate.transform.rotation = msg.Rotation.ToUnity();
                             var rb = crate.GetComponent<Rigidbody>();
                             if (rb != null)
                             {
@@ -5408,6 +5501,8 @@ namespace MineMogulMultiplayer.Core
             _remotelyHeldOres.Clear();
             _remotelyHeldCrates.Clear();
             _prevHeldObjectId = null;
+            _prevHeldObjectVelocity = Vector3.zero;
+            _prevHeldObjectRb = null;
             _lastValidToolName = null;
             _toolNullTicks = 0;
             _nextOreNetId = 1;
@@ -5500,6 +5595,40 @@ namespace MineMogulMultiplayer.Core
             // Join the lobby (not P2P — just the Steam lobby)
             var playerName = SteamClient.Name ?? "Player";
             JoinLobbyDirect(lobby, playerName);
+        }
+
+        // ── Sound event sync ────────────────────────
+
+        /// <summary>Broadcast a sound event to all other players.</summary>
+        public void BroadcastSoundEvent(string soundName, Vector3 position)
+        {
+            if (_net == null || !_net.IsRunning) return;
+            var msg = new SoundEventMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                SoundName = soundName,
+                Position = new NetVector3(position)
+            };
+            if (MultiplayerState.IsHost)
+                _net.SendToAll(MessageType.SoundEvent, msg);
+            else
+                _net.SendToHost(MessageType.SoundEvent, msg);
+        }
+
+        /// <summary>Host: relay a client's sound event to all other clients.</summary>
+        private void HandleSoundEventFromClient(uint clientId, SoundEventMessage msg)
+        {
+            // Play locally on host
+            Patches.SoundPatch.PlayRemoteSound(msg.SoundName, msg.Position.ToUnity());
+            // Relay to all clients (they'll skip if it's their own)
+            _net.SendToAll(MessageType.SoundEvent, msg);
+        }
+
+        /// <summary>Client: play a sound event received from host.</summary>
+        private void HandleSoundEventOnClient(SoundEventMessage msg)
+        {
+            if (msg.PlayerId == MultiplayerState.LocalPlayerId) return; // skip own sounds
+            Patches.SoundPatch.PlayRemoteSound(msg.SoundName, msg.Position.ToUnity());
         }
 
         // ── Event log helpers ────────────────────────
