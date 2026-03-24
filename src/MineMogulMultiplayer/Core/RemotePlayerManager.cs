@@ -28,19 +28,20 @@ namespace MineMogulMultiplayer.Core
             public Transform RightHand;      // parent for held tool visual
             public GameObject HeldToolGo;    // current tool visual (destroyed on swap)
             public string CurrentToolId;     // SavableObjectID name, or null
+            public GameObject HeldWorldGo;   // world-space visual for physics-held object
+            public string CurrentHeldWorldId;
             public MinerWalkAnim Anim;       // walk animation component (for arm pose)
             public int ToolNullTicks;        // client-side debounce counter for empty tool
             public bool IsCrouching;
         }
 
         /// <summary>How many consecutive empty-tool ticks before clearing the visual on a remote player.</summary>
-        private const int RemoteToolNullDebounce = 30;
+        private const int RemoteToolNullDebounce = 120;
 
         /// <summary>
-        /// Vertical offset applied to the remote player root so the model's feet align with the ground.
-        /// MineMogul's PlayerController.transform sits at capsule center (~1 m above ground).
-        /// Our procedural miner has boots at y≈0, so lowering the root by ~1 m grounds the model.
-        /// Adjusted via ground raycast when possible.
+        /// Vertical offset applied to remote visuals.
+        /// The networked player transform sits near capsule center, so lower the
+        /// visual to keep feet on the ground.
         /// </summary>
         private const float FallbackYOffset = -0.9f;
 
@@ -70,19 +71,26 @@ namespace MineMogulMultiplayer.Core
                 rp.TargetPosition = GroundAlign(rawPos);
                 rp.TargetRotation = ps.Rotation.ToUnity();
 
-                // Swap held tool visual if the equipped item changed (with debounce for empty values)
-                string newTool = ps.EquippedTool;
+                // While a physics object is being held (crate/lantern/etc), we only render
+                // the world-space proxy to avoid duplicate "tool-in-hand + object-in-world" visuals.
+                string heldWorldId = NormalizeToolId(ps.HeldObjectId);
+                bool suppressHandTool = !string.IsNullOrEmpty(heldWorldId);
+                string newTool = suppressHandTool ? null : NormalizeToolId(ps.EquippedTool);
                 if (newTool != rp.CurrentToolId)
                 {
                     // Debounce: if the new tool is empty but we have a valid current tool, delay the change
                     if (string.IsNullOrEmpty(newTool) && !string.IsNullOrEmpty(rp.CurrentToolId))
                     {
-                        rp.ToolNullTicks++;
-                        if (rp.ToolNullTicks < RemoteToolNullDebounce)
+                        // Do not debounce when we're explicitly suppressing hand tool due to held world object.
+                        if (!suppressHandTool)
                         {
-                            // Ignore the empty value for now — keep current tool visual
-                            _remotePlayers[ps.PlayerId] = rp;
-                            continue;
+                            rp.ToolNullTicks++;
+                            if (rp.ToolNullTicks < RemoteToolNullDebounce)
+                            {
+                                // Ignore the empty value for now — keep current tool visual
+                                _remotePlayers[ps.PlayerId] = rp;
+                                continue;
+                            }
                         }
                     }
                     rp.ToolNullTicks = 0;
@@ -98,6 +106,38 @@ namespace MineMogulMultiplayer.Core
                 else
                 {
                     rp.ToolNullTicks = 0; // Reset debounce when tool matches
+
+                    // If a tool should be shown but the visual is missing, rebuild it.
+                    if (!string.IsNullOrEmpty(newTool) && rp.HeldToolGo == null)
+                    {
+                        rp.HeldToolGo = BuildToolVisual(newTool, rp.RightHand);
+                        if (rp.Anim != null)
+                            rp.Anim.HoldingTool = rp.HeldToolGo != null;
+                        _logSource?.LogWarning($"[RemotePlayer] Rebuilt missing tool visual for P{ps.PlayerId}: '{newTool}', ok={rp.HeldToolGo != null}");
+                    }
+                }
+
+                // If the remote player is physically holding a world object (lantern/tool),
+                // render a world-space proxy so everyone sees it moving around the map.
+                if (!string.IsNullOrEmpty(heldWorldId))
+                {
+                    if (rp.HeldWorldGo == null || rp.CurrentHeldWorldId != heldWorldId)
+                    {
+                        if (rp.HeldWorldGo != null) Object.Destroy(rp.HeldWorldGo);
+                        rp.HeldWorldGo = BuildWorldToolVisual(heldWorldId);
+                        rp.CurrentHeldWorldId = heldWorldId;
+                    }
+                    if (rp.HeldWorldGo != null)
+                    {
+                        rp.HeldWorldGo.transform.position = ps.HeldObjectPosition.ToUnity();
+                        rp.HeldWorldGo.transform.rotation = ps.HeldObjectRotation.ToUnity();
+                    }
+                }
+                else
+                {
+                    if (rp.HeldWorldGo != null) Object.Destroy(rp.HeldWorldGo);
+                    rp.HeldWorldGo = null;
+                    rp.CurrentHeldWorldId = null;
                 }
 
                 // Update crouch state
@@ -123,8 +163,11 @@ namespace MineMogulMultiplayer.Core
             }
             foreach (var id in toRemove)
             {
-                if (_remotePlayers.TryGetValue(id, out var rp) && rp.Go != null)
-                    Object.Destroy(rp.Go);
+                if (_remotePlayers.TryGetValue(id, out var rp))
+                {
+                    if (rp.Go != null) Object.Destroy(rp.Go);
+                    if (rp.HeldWorldGo != null) Object.Destroy(rp.HeldWorldGo);
+                }
                 _remotePlayers.Remove(id);
             }
         }
@@ -149,8 +192,39 @@ namespace MineMogulMultiplayer.Core
             {
                 if (kv.Value.Go != null)
                     Object.Destroy(kv.Value.Go);
+                if (kv.Value.HeldWorldGo != null)
+                    Object.Destroy(kv.Value.HeldWorldGo);
             }
             _remotePlayers.Clear();
+        }
+
+        /// <summary>Build a world-space visual proxy for a remote physics-held tool/object.</summary>
+        private static GameObject BuildWorldToolVisual(string toolId)
+        {
+            if (string.IsNullOrEmpty(toolId))
+                toolId = "HeldObject";
+
+            var root = new GameObject($"RemoteHeldWorld_{toolId}");
+            root.layer = 0;
+
+            // Use prefab clone path first for recognizable visuals.
+            var visual = TryCloneToolFromPrefab(toolId, root.transform, 0.95f);
+            if (visual == null)
+            {
+                var shader = FindWorkingShader();
+                visual = BuildGenericTool(root.transform, shader);
+            }
+
+            if (visual != null)
+            {
+                foreach (var rend in root.GetComponentsInChildren<Renderer>(true))
+                {
+                    rend.enabled = true;
+                    rend.forceRenderingOff = false;
+                    rend.gameObject.layer = 0;
+                }
+            }
+            return root;
         }
 
         /// <summary>
@@ -165,8 +239,11 @@ namespace MineMogulMultiplayer.Core
 
         private static RemotePlayer SpawnRemotePlayer(PlayerState ps)
         {
+            var pos = GroundAlign(ps.Position.ToUnity());
+            _logSource?.LogInfo($"[RemotePlayer] Spawning P{ps.PlayerId} '{ps.DisplayName}' at ({pos.x:F1},{pos.y:F1},{pos.z:F1})");
+
             var go = CreatePlayerVisual(ps.DisplayName ?? $"Player {ps.PlayerId}", out Transform rightHand, out MinerWalkAnim anim);
-            go.transform.position = GroundAlign(ps.Position.ToUnity());
+            go.transform.position = pos;
             go.transform.rotation = ps.Rotation.ToUnity();
 
             // Nametag: world-space text floating above the miner
@@ -274,7 +351,13 @@ namespace MineMogulMultiplayer.Core
                 new Vector3(0.16f, 0.50f, 0.20f), shirtCol, shader);
             var rightHandGo = MakeCube(rightArmPivot.transform, new Vector3(0, -0.55f, 0),
                 new Vector3(0.14f, 0.12f, 0.16f), skinCol, shader);
-            rightHand = rightHandGo.transform;
+
+            // Tool attach point: same position as the hand but with unit scale
+            // so tools parented here are not squished by the hand cube's tiny localScale.
+            var toolAttach = new GameObject("ToolAttach");
+            toolAttach.transform.SetParent(rightArmPivot.transform, false);
+            toolAttach.transform.localPosition = new Vector3(0, -0.55f, 0);
+            rightHand = toolAttach.transform;
 
             // ── Neck ─────────────────────────────────
             MakeCube(go.transform, new Vector3(0, 1.38f, 0),
@@ -319,10 +402,15 @@ namespace MineMogulMultiplayer.Core
         /// <summary>Build a held-item visual for the given SavableObjectID name. Returns null for empty-handed.</summary>
         private static GameObject BuildToolVisual(string toolId, Transform hand)
         {
+            toolId = NormalizeToolId(toolId);
             if (string.IsNullOrEmpty(toolId) || hand == null) return null;
 
+            // Physics-holdable objects (crates) are already visible as real world objects.
+            // Don't create a duplicate hand-tool visual — that causes "box inside box".
+            if (IsPhysicsHoldable(toolId)) return null;
+
             // Try to clone the actual game prefab first — gives pixel-perfect visuals
-            var cloned = TryCloneToolFromPrefab(toolId, hand);
+            var cloned = TryCloneToolFromPrefab(toolId, hand, 0.85f);
             if (cloned != null)
             {
                 _logSource?.LogInfo($"[RemotePlayer] Cloned prefab visual for '{toolId}'");
@@ -358,14 +446,17 @@ namespace MineMogulMultiplayer.Core
 
         /// <summary>
         /// Attempt to clone the visual part of a game tool prefab.
-        /// Instantiates the prefab, extracts all renderers into a clean holder,
-        /// strips all game logic scripts, and parents to the remote player hand.
+        /// For tools with BaseHeldTool, uses the WorldModel (clean third-person model
+        /// without first-person hands/arms). For other objects, uses all renderers.
         /// Returns null if the prefab can't be loaded or has no renderers.
         /// </summary>
-        private static GameObject TryCloneToolFromPrefab(string toolId, Transform hand)
+        private static GameObject TryCloneToolFromPrefab(string toolId, Transform hand, float targetSize)
         {
             try
             {
+                toolId = NormalizeToolId(toolId);
+                if (string.IsNullOrEmpty(toolId)) return null;
+
                 if (!System.Enum.TryParse<SavableObjectID>(toolId, out var savableId))
                     return null;
 
@@ -379,8 +470,26 @@ namespace MineMogulMultiplayer.Core
                 var tempInstance = Object.Instantiate(prefab, new Vector3(0, -9999, 0), Quaternion.identity);
                 // Keep active so lossyScale is computed correctly by Unity
 
-                // Gather all renderers from the instantiated prefab
-                var renderers = tempInstance.GetComponentsInChildren<Renderer>(true);
+                // For tools with BaseHeldTool, use the WorldModel child (clean 3rd-person
+                // model without first-person hands/arms). This is the same model the game
+                // shows when a tool is lying on the ground.
+                Transform modelRoot = tempInstance.transform;
+                var baseHeldTool = tempInstance.GetComponent<BaseHeldTool>();
+                bool usedWorldModel = false;
+                if (baseHeldTool != null && baseHeldTool.WorldModel != null)
+                {
+                    baseHeldTool.WorldModel.SetActive(true);
+                    modelRoot = baseHeldTool.WorldModel.transform;
+                    usedWorldModel = true;
+                    _logSource?.LogInfo($"[RemotePlayer] Using WorldModel for '{toolId}' — WorldModel localScale={baseHeldTool.WorldModel.transform.localScale}, lossyScale={baseHeldTool.WorldModel.transform.lossyScale}");
+                }
+                else
+                {
+                    _logSource?.LogInfo($"[RemotePlayer] No WorldModel for '{toolId}', using all renderers — prefab localScale={tempInstance.transform.localScale}");
+                }
+
+                // Gather renderers from the chosen model root
+                var renderers = modelRoot.GetComponentsInChildren<Renderer>(true);
                 if (renderers == null || renderers.Length == 0)
                 {
                     Object.Destroy(tempInstance);
@@ -390,82 +499,94 @@ namespace MineMogulMultiplayer.Core
                 // Create a clean holder parented to the hand
                 var holder = new GameObject($"ToolClone_{toolId}");
                 holder.transform.SetParent(hand, false);
-                holder.transform.localPosition = new Vector3(0, -0.04f, 0.10f);
-                holder.transform.localEulerAngles = new Vector3(-30f, 0, 0);
+
+                // Per-tool orientation / position overrides
+                var overrides = GetToolOverrides(toolId);
+                holder.transform.localPosition = overrides.LocalPos;
+                holder.transform.localEulerAngles = overrides.LocalRot;
 
                 // Calculate combined bounds in prefab-local space using mesh.bounds
                 // (renderer.bounds is world-space and unreliable on freshly created objects)
                 bool hasBounds = false;
                 Bounds localBounds = default;
+                int meshIndex = 0;
 
                 // Clone each renderer into a clean child of our holder
                 foreach (var srcRend in renderers)
                 {
+                    Mesh meshToClone = null;
+                    bool isSkinned = false;
+
                     var srcMf = srcRend.GetComponent<MeshFilter>();
                     if (srcRend is MeshRenderer && srcMf != null && srcMf.sharedMesh != null)
                     {
-                        var visualGo = new GameObject(srcRend.gameObject.name);
-                        visualGo.transform.SetParent(holder.transform, false);
-
-                        // Copy transform relative to the prefab root
-                        var relPos = tempInstance.transform.InverseTransformPoint(srcRend.transform.position);
-                        var relRot = Quaternion.Inverse(tempInstance.transform.rotation) * srcRend.transform.rotation;
-                        // Scale relative to prefab root (not absolute world scale)
-                        var rootScale = tempInstance.transform.lossyScale;
-                        var relScale = new Vector3(
-                            srcRend.transform.lossyScale.x / Mathf.Max(rootScale.x, 0.0001f),
-                            srcRend.transform.lossyScale.y / Mathf.Max(rootScale.y, 0.0001f),
-                            srcRend.transform.lossyScale.z / Mathf.Max(rootScale.z, 0.0001f));
-
-                        visualGo.transform.localPosition = relPos;
-                        visualGo.transform.localRotation = relRot;
-                        visualGo.transform.localScale = relScale;
-
-                        // Add mesh components
-                        var newMf = visualGo.AddComponent<MeshFilter>();
-                        newMf.sharedMesh = srcMf.sharedMesh;
-
-                        var newRend = visualGo.AddComponent<MeshRenderer>();
-                        newRend.sharedMaterials = srcRend.sharedMaterials;
-
-                        // Track bounds in holder-local space using mesh.bounds * scale
-                        var meshSize = Vector3.Scale(srcMf.sharedMesh.bounds.size, relScale);
-                        var meshCenter = relPos + relRot * Vector3.Scale(srcMf.sharedMesh.bounds.center, relScale);
-                        var meshBounds = new Bounds(meshCenter, meshSize);
-                        if (!hasBounds) { localBounds = meshBounds; hasBounds = true; }
-                        else localBounds.Encapsulate(meshBounds);
+                        meshToClone = srcMf.sharedMesh;
                     }
                     else if (srcRend is SkinnedMeshRenderer smr && smr.sharedMesh != null)
                     {
                         var baked = new Mesh();
                         smr.BakeMesh(baked);
-
-                        var visualGo = new GameObject(srcRend.gameObject.name);
-                        visualGo.transform.SetParent(holder.transform, false);
-
-                        var relPos = tempInstance.transform.InverseTransformPoint(srcRend.transform.position);
-                        var relRot = Quaternion.Inverse(tempInstance.transform.rotation) * srcRend.transform.rotation;
-                        var rootScale2 = tempInstance.transform.lossyScale;
-                        var relScale = new Vector3(
-                            srcRend.transform.lossyScale.x / Mathf.Max(rootScale2.x, 0.0001f),
-                            srcRend.transform.lossyScale.y / Mathf.Max(rootScale2.y, 0.0001f),
-                            srcRend.transform.lossyScale.z / Mathf.Max(rootScale2.z, 0.0001f));
-                        visualGo.transform.localPosition = relPos;
-                        visualGo.transform.localRotation = relRot;
-                        visualGo.transform.localScale = relScale;
-
-                        var newMf = visualGo.AddComponent<MeshFilter>();
-                        newMf.sharedMesh = baked;
-
-                        var newRend = visualGo.AddComponent<MeshRenderer>();
-                        newRend.sharedMaterials = srcRend.sharedMaterials;
-
-                        var meshSize = Vector3.Scale(baked.bounds.size, relScale);
-                        var meshCenter = relPos + relRot * Vector3.Scale(baked.bounds.center, relScale);
-                        var meshBounds = new Bounds(meshCenter, meshSize);
-                        if (!hasBounds) { localBounds = meshBounds; hasBounds = true; }
-                        else localBounds.Encapsulate(meshBounds);
+                        meshToClone = baked;
+                        isSkinned = true;
                     }
+
+                    if (meshToClone == null) continue;
+
+                    // Diagnostic: log every mesh we encounter
+                    string meshName = isSkinned ? srcRend.gameObject.name + " (skinned)" : (srcMf?.sharedMesh?.name ?? srcRend.gameObject.name);
+                    _logSource?.LogInfo($"[ToolClone] '{toolId}' mesh[{meshIndex}]: name='{meshName}' goName='{srcRend.gameObject.name}' verts={meshToClone.vertexCount} submeshes={meshToClone.subMeshCount} bounds={meshToClone.bounds.size} center={meshToClone.bounds.center}");
+
+                    // Skip meshes that are likely non-visual (shadow discs, collider outlines, etc.)
+                    string goNameLower = srcRend.gameObject.name.ToLowerInvariant();
+                    if (goNameLower.Contains("shadow") || goNameLower.Contains("collider") ||
+                        goNameLower.Contains("particle") || goNameLower.Contains("decal") ||
+                        goNameLower.Contains("icon"))
+                    {
+                        _logSource?.LogInfo($"[ToolClone] '{toolId}' mesh[{meshIndex}]: SKIPPED (name filter: '{srcRend.gameObject.name}')");
+                        meshIndex++;
+                        continue;
+                    }
+
+                    // Skip flat quads (4 verts) — these are often shadow/selection indicators
+                    if (meshToClone.vertexCount <= 4)
+                    {
+                        _logSource?.LogInfo($"[ToolClone] '{toolId}' mesh[{meshIndex}]: SKIPPED (too few verts: {meshToClone.vertexCount})");
+                        meshIndex++;
+                        continue;
+                    }
+
+                    meshIndex++;
+
+                    var visualGo = new GameObject(srcRend.gameObject.name);
+                    visualGo.transform.SetParent(holder.transform, false);
+
+                    // Copy transform relative to the model root (WorldModel or prefab root)
+                    var relPos = modelRoot.InverseTransformPoint(srcRend.transform.position);
+                    var relRot = Quaternion.Inverse(modelRoot.rotation) * srcRend.transform.rotation;
+                    // Scale relative to model root (not absolute world scale)
+                    var rootScale = modelRoot.lossyScale;
+                    var relScale = new Vector3(
+                        srcRend.transform.lossyScale.x / Mathf.Max(rootScale.x, 0.0001f),
+                        srcRend.transform.lossyScale.y / Mathf.Max(rootScale.y, 0.0001f),
+                        srcRend.transform.lossyScale.z / Mathf.Max(rootScale.z, 0.0001f));
+
+                    visualGo.transform.localPosition = relPos;
+                    visualGo.transform.localRotation = relRot;
+                    visualGo.transform.localScale = relScale;
+
+                    // Add mesh components
+                    var newMf = visualGo.AddComponent<MeshFilter>();
+                    newMf.sharedMesh = meshToClone;
+
+                    var newRend = visualGo.AddComponent<MeshRenderer>();
+                    newRend.sharedMaterials = srcRend.sharedMaterials;
+
+                    // Track bounds in holder-local space using mesh.bounds * scale
+                    var meshSize = Vector3.Scale(meshToClone.bounds.size, relScale);
+                    var meshCenter = relPos + relRot * Vector3.Scale(meshToClone.bounds.center, relScale);
+                    var meshBounds = new Bounds(meshCenter, meshSize);
+                    if (!hasBounds) { localBounds = meshBounds; hasBounds = true; }
+                    else localBounds.Encapsulate(meshBounds);
                 }
 
                 // Destroy the temp instance — we only needed the meshes/materials
@@ -499,22 +620,32 @@ namespace MineMogulMultiplayer.Core
                 }
                 holder.layer = 0;
 
-                // Scale the cloned tool so its largest dimension fits approx 0.5m
-                // Game prefabs vary wildly in scale — normalize bidirectionally
+                // Scale the cloned tool so its largest dimension fits the target size.
+                // Then shift it so the grip area (bottom of bounds along the Y axis)
+                // is near the hand — otherwise the center of mass sits at the hand
+                // and the tool looks improperly centered.
                 if (hasBounds)
                 {
+                    float actualTargetSize = overrides.TargetSize > 0 ? overrides.TargetSize : targetSize;
                     float maxExtent = Mathf.Max(localBounds.size.x,
                         Mathf.Max(localBounds.size.y, localBounds.size.z));
                     if (maxExtent > 0.001f)
                     {
-                        float targetSize = 0.5f;
-                        float scaleFactor = targetSize / maxExtent;
+                        float scaleFactor = actualTargetSize / maxExtent;
                         holder.transform.localScale = Vector3.one * scaleFactor;
+
+                        // Shift the tool so the grip zone sits at the hand.
+                        // gripFraction=0.2 means the bottom 20% of Y is at the hand.
+                        float gripFrac = overrides.GripFraction;
+                        float yMin = localBounds.center.y - localBounds.extents.y;
+                        float gripY = yMin + localBounds.size.y * gripFrac;
+                        foreach (Transform child in holder.transform)
+                            child.localPosition -= new Vector3(localBounds.center.x, gripY, localBounds.center.z);
                     }
                 }
 
                 holder.SetActive(true);
-                _logSource?.LogInfo($"[RemotePlayer] Cloned prefab '{toolId}' with {holder.transform.childCount} mesh(es), localBounds={localBounds.size}, holderScale={holder.transform.localScale}");
+                _logSource?.LogInfo($"[RemotePlayer] Cloned prefab '{toolId}' worldModel={usedWorldModel} meshes={holder.transform.childCount} localBounds={localBounds.size} holderScale={holder.transform.localScale} parentLossyScale={hand.lossyScale}");
                 return holder;
             }
             catch (System.Exception ex)
@@ -522,6 +653,113 @@ namespace MineMogulMultiplayer.Core
                 _logSource?.LogWarning($"[RemotePlayer] Prefab clone failed for '{toolId}': {ex.GetType().Name}: {ex.Message}");
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Iterate all known tool SavableObjectIDs and log their WorldModel hierarchy.
+        /// Call once to audit every tool prefab in the game — helps verify that cloned
+        /// visuals will look correct.
+        /// </summary>
+        public static void AuditAllToolPrefabs()
+        {
+            var toolIds = new[]
+            {
+                SavableObjectID.ToolBuilder,
+                SavableObjectID.HammerBasic,
+                SavableObjectID.Lantern,
+                SavableObjectID.MagnetTool,
+                SavableObjectID.PickaxeBasic,
+                SavableObjectID.ResourceScannerTool,
+                SavableObjectID.RapidAutoMinerStandardDrillBit,
+                SavableObjectID.RapidAutoMinerTurboDrillBit,
+                SavableObjectID.RapidAutoMinerHardenedDrillBit,
+                SavableObjectID.WrenchTool,
+                SavableObjectID.DebugSpawnTool,
+                SavableObjectID.IngotMold,
+                SavableObjectID.GearMold,
+                SavableObjectID.DoubleIngotMold,
+                SavableObjectID.JackHammer,
+                SavableObjectID.HardHat,
+                SavableObjectID.MiningHelmet,
+            };
+
+            var slm = Singleton<SavingLoadingManager>.Instance;
+            if (slm == null)
+            {
+                _logSource?.LogWarning("[Audit] SavingLoadingManager not available");
+                return;
+            }
+
+            _logSource?.LogInfo("[Audit] ===== TOOL PREFAB AUDIT START =====");
+            foreach (var id in toolIds)
+            {
+                try
+                {
+                    var prefab = slm.GetPrefab(id);
+                    if (prefab == null) { _logSource?.LogWarning($"[Audit] {id}: prefab is NULL"); continue; }
+
+                    var temp = Object.Instantiate(prefab, new Vector3(0, -9999, 0), Quaternion.identity);
+                    var bht = temp.GetComponent<BaseHeldTool>();
+                    bool hasWorldModel = bht != null && bht.WorldModel != null;
+                    Transform root = hasWorldModel ? bht.WorldModel.transform : temp.transform;
+                    if (hasWorldModel) bht.WorldModel.SetActive(true);
+
+                    var allRenderers = root.GetComponentsInChildren<Renderer>(true);
+                    _logSource?.LogInfo($"[Audit] {id}: hasWorldModel={hasWorldModel} renderers={allRenderers.Length} rootScale={root.localScale} rootLossyScale={root.lossyScale}");
+
+                    for (int i = 0; i < allRenderers.Length; i++)
+                    {
+                        var r = allRenderers[i];
+                        Mesh m = null;
+                        string type = "unknown";
+                        var mf = r.GetComponent<MeshFilter>();
+                        if (r is MeshRenderer && mf != null && mf.sharedMesh != null)
+                        {
+                            m = mf.sharedMesh;
+                            type = "MeshRenderer";
+                        }
+                        else if (r is SkinnedMeshRenderer smr && smr.sharedMesh != null)
+                        {
+                            m = smr.sharedMesh;
+                            type = "SkinnedMeshRenderer";
+                        }
+                        _logSource?.LogInfo($"[Audit]   [{i}] '{r.gameObject.name}' type={type} mesh='{m?.name ?? "null"}' verts={m?.vertexCount ?? 0} submeshes={m?.subMeshCount ?? 0} bounds={m?.bounds.size} matCount={r.sharedMaterials?.Length ?? 0} path={GetRelativePath(root, r.transform)}");
+                    }
+
+                    // Also dump the full child hierarchy
+                    DumpHierarchy(root, 0, id.ToString());
+
+                    Object.Destroy(temp);
+                }
+                catch (System.Exception ex)
+                {
+                    _logSource?.LogWarning($"[Audit] {id}: EXCEPTION {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+            _logSource?.LogInfo("[Audit] ===== TOOL PREFAB AUDIT END =====");
+        }
+
+        private static string GetRelativePath(Transform root, Transform child)
+        {
+            var path = child.gameObject.name;
+            var current = child.parent;
+            while (current != null && current != root)
+            {
+                path = current.gameObject.name + "/" + path;
+                current = current.parent;
+            }
+            return path;
+        }
+
+        private static void DumpHierarchy(Transform root, int depth, string toolId)
+        {
+            string indent = new string(' ', depth * 2);
+            int childCount = root.childCount;
+            var renderers = root.GetComponents<Renderer>();
+            string rendInfo = renderers.Length > 0 ? $" [has {renderers.Length} renderer(s)]" : "";
+            _logSource?.LogInfo($"[Audit:{toolId}] {indent}{root.gameObject.name} active={root.gameObject.activeSelf} localScale={root.localScale}{rendInfo}");
+            for (int i = 0; i < childCount; i++)
+                DumpHierarchy(root.GetChild(i), depth + 1, toolId);
         }
 
         /// <summary>Find a shader that works in this render pipeline (URP, Built-in, or fallback).</summary>
@@ -535,6 +773,171 @@ namespace MineMogulMultiplayer.Core
             if (shader != null) return shader;
             shader = Shader.Find("Unlit/Color");
             return shader;
+        }
+
+        /// <summary>Returns true if the tool ID refers to a physics-holdable world object
+        /// (e.g. crates) whose real game object is already visible in-scene and synced
+        /// via the crate/ore position system. We skip creating hand-tool visuals for these.</summary>
+        private static bool IsPhysicsHoldable(string toolId)
+        {
+            if (string.IsNullOrEmpty(toolId)) return false;
+            return toolId.StartsWith("BreakableCrate", System.StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizeToolId(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            var value = raw.Trim();
+            if (value.EndsWith("(Clone)", System.StringComparison.OrdinalIgnoreCase))
+                value = value.Substring(0, value.Length - "(Clone)".Length).Trim();
+            return string.IsNullOrEmpty(value) ? null : value;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Per-tool orientation / sizing overrides
+        // ─────────────────────────────────────────────
+
+        private struct ToolVisualOverrides
+        {
+            public Vector3 LocalPos;   // holder localPosition relative to hand
+            public Vector3 LocalRot;   // holder localEulerAngles
+            public float TargetSize;   // 0 = use default
+            public float GripFraction; // 0..1, where along the Y axis the hand grips (0=bottom, 1=top)
+        }
+
+        /// <summary>
+        /// Return per-tool overrides for position, rotation, scale, and grip.
+        /// WorldModel meshes have different native orientations:
+        ///   - Pickaxe/Hammer/Wrench/DrillBits: handle along +Y (Y-dominant)
+        ///   - Magnet/Scanner/JackHammer: barrel/bit along +Z (Z-dominant)
+        ///   - Lantern: upright Y-dominant, hung from top handle
+        ///
+        /// ToolAttach's local +Y points back toward the shoulder.
+        /// The arm pivots -55° X when holding a tool (ToolHoldAngle).
+        ///
+        /// Y-dominant tools: (0,0,180) — the 180° Z flips Y so the tool head
+        ///   extends AWAY from the shoulder (outward from hand).
+        /// Z-dominant tools: (55,0,0) — the 55° X compensates for the arm tilt
+        ///   so the barrel/bit points forward in world space and the body stays upright.
+        /// </summary>
+        private static ToolVisualOverrides GetToolOverrides(string toolId)
+        {
+            var defaults = new ToolVisualOverrides
+            {
+                LocalPos = new Vector3(0, -0.04f, 0.08f),
+                LocalRot = new Vector3(-30f, 0, 0),
+                TargetSize = 0.85f,
+                GripFraction = 0.15f
+            };
+
+            switch (toolId)
+            {
+                // ── Y-dominant: handle along +Y ──
+                // 180° Z-rotation flips both X and Y so the tool head extends
+                // away from the shoulder instead of running up the arm.
+                case "PickaxeBasic":
+                    return new ToolVisualOverrides
+                    {
+                        LocalPos = new Vector3(0, -0.02f, 0.04f),
+                        LocalRot = new Vector3(0, 0, 180f),
+                        TargetSize = 0.80f,
+                        GripFraction = 0.20f
+                    };
+
+                case "HammerBasic":
+                    return new ToolVisualOverrides
+                    {
+                        LocalPos = new Vector3(0, -0.02f, 0.04f),
+                        LocalRot = new Vector3(0, 0, 180f),
+                        TargetSize = 0.70f,
+                        GripFraction = 0.20f
+                    };
+
+                case "WrenchTool":
+                    return new ToolVisualOverrides
+                    {
+                        LocalPos = new Vector3(0, -0.02f, 0.04f),
+                        LocalRot = new Vector3(0, 0, 180f),
+                        TargetSize = 0.75f,
+                        GripFraction = 0.20f
+                    };
+
+                // ── Y-dominant drill bits ──
+                case "RapidAutoMinerStandardDrillBit":
+                case "RapidAutoMinerTurboDrillBit":
+                case "RapidAutoMinerHardenedDrillBit":
+                    return new ToolVisualOverrides
+                    {
+                        LocalPos = new Vector3(0, -0.02f, 0.04f),
+                        LocalRot = new Vector3(0, 0, 180f),
+                        TargetSize = 0.70f,
+                        GripFraction = 0.20f
+                    };
+
+                // ── Z-dominant: barrel/bit along +Z ──
+                // 55° X-rotation compensates for the arm's -55° ToolHoldAngle so
+                // the barrel points forward in world space and the body stays upright.
+                case "MagnetTool":
+                case "ResourceScannerTool":
+                case "DebugSpawnTool":
+                    return new ToolVisualOverrides
+                    {
+                        LocalPos = new Vector3(0, -0.04f, 0.06f),
+                        LocalRot = new Vector3(55f, 0, 0),
+                        TargetSize = 0.55f,
+                        GripFraction = 0.45f
+                    };
+
+                case "JackHammer":
+                    return new ToolVisualOverrides
+                    {
+                        // Z=2.48 longest — bit along Z, not Y
+                        LocalPos = new Vector3(0, -0.04f, 0.06f),
+                        LocalRot = new Vector3(55f, 0, 0),
+                        TargetSize = 0.80f,
+                        GripFraction = 0.40f
+                    };
+
+                // ── Lantern: upright, hung below the hand ──
+                // Same 55° X to counter arm tilt so lantern hangs straight down.
+                case "Lantern":
+                    return new ToolVisualOverrides
+                    {
+                        LocalPos = new Vector3(0, -0.02f, 0.06f),
+                        LocalRot = new Vector3(55f, 0, 0),
+                        TargetSize = 0.50f,
+                        GripFraction = 0.85f
+                    };
+
+                // ── Molds: flat tray-like items ──
+                case "IngotMold":
+                case "GearMold":
+                case "DoubleIngotMold":
+                    return new ToolVisualOverrides
+                    {
+                        LocalPos = new Vector3(0, -0.04f, 0.10f),
+                        LocalRot = new Vector3(45f, 0, 0),
+                        TargetSize = 0.50f,
+                        GripFraction = 0.30f
+                    };
+
+                // ── Hats: worn items ──
+                case "HardHat":
+                case "MiningHelmet":
+                    return new ToolVisualOverrides
+                    {
+                        LocalPos = new Vector3(0, -0.04f, 0.08f),
+                        LocalRot = new Vector3(45f, 0, 0),
+                        TargetSize = 0.45f,
+                        GripFraction = 0.30f
+                    };
+
+                case "ToolBuilder":
+                    return defaults;
+
+                default:
+                    return defaults;
+            }
         }
 
         // Shared colours
@@ -686,11 +1089,31 @@ namespace MineMogulMultiplayer.Core
             var rend = cube.GetComponent<Renderer>();
             if (rend != null)
             {
-                var mat = new Material(shader);
-                mat.color = color;
-                mat.SetFloat("_Glossiness", 0.15f);
-                mat.SetFloat("_Metallic", 0.0f);
-                rend.material = mat;
+                if (shader != null)
+                {
+                    var mat = new Material(shader);
+                    // URP uses _BaseColor, Standard uses _Color
+                    if (mat.HasProperty("_BaseColor"))
+                        mat.SetColor("_BaseColor", color);
+                    else
+                        mat.color = color;
+                    mat.SetFloat("_Glossiness", 0.15f);
+                    mat.SetFloat("_Metallic", 0.0f);
+                    mat.SetFloat("_Smoothness", 0.15f); // URP equivalent
+                    rend.material = mat;
+                }
+                else
+                {
+                    // Last-resort: keep primitive default material but tint if possible.
+                    if (rend.material != null)
+                    {
+                        if (rend.material.HasProperty("_BaseColor"))
+                            rend.material.SetColor("_BaseColor", color);
+                        else if (rend.material.HasProperty("_Color"))
+                            rend.material.color = color;
+                    }
+                }
+                rend.forceRenderingOff = false;
             }
             return cube;
         }
@@ -745,12 +1168,12 @@ namespace MineMogulMultiplayer.Core
         private float _phase;          // oscillator phase
         private float _currentSwing;   // current amplitude (ramps up/down)
         private float _crouchBlend;    // 0 = standing, 1 = fully crouched
-        private Vector3 _baseLocalPos; // original local position of the root
+        private float _appliedCrouchYOffset; // currently applied world-space crouch offset
 
         private void Start()
         {
             _lastPos = transform.position;
-            _baseLocalPos = transform.localPosition;
+            _appliedCrouchYOffset = 0f;
         }
 
         private void Update()
@@ -762,8 +1185,17 @@ namespace MineMogulMultiplayer.Core
             float crouchTarget = Crouching ? 1f : 0f;
             _crouchBlend = Mathf.MoveTowards(_crouchBlend, crouchTarget, CrouchTransitionSpeed * dt);
 
-            // Apply crouch Y offset to the root so the model visibly lowers
-            transform.localPosition = _baseLocalPos + new Vector3(0, _crouchBlend * CrouchYOffset, 0);
+            // Apply crouch as an incremental world-space Y offset.
+            // Do NOT reset localPosition here, otherwise networked movement gets overwritten.
+            float targetCrouchOffset = _crouchBlend * CrouchYOffset;
+            float deltaCrouchOffset = targetCrouchOffset - _appliedCrouchYOffset;
+            if (Mathf.Abs(deltaCrouchOffset) > 0.0001f)
+            {
+                var wp = transform.position;
+                wp.y += deltaCrouchOffset;
+                transform.position = wp;
+                _appliedCrouchYOffset = targetCrouchOffset;
+            }
 
             // Measure horizontal movement speed
             var pos = transform.position;

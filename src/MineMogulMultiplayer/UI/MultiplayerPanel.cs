@@ -59,6 +59,9 @@ namespace MineMogulMultiplayer.UI
         private Button _debugBotBtn;
         private TextMeshProUGUI _debugBotBtnLabel;
         private TextMeshProUGUI _debugInfoText;
+        private Button _resyncBtn;
+        private Button _dumpBtn;
+        private Button _moneyBtn;
 
         // Debug overlay (always visible during gameplay when toggled)
         private Canvas _debugOverlayCanvas;
@@ -70,6 +73,8 @@ namespace MineMogulMultiplayer.UI
         private float _refreshTimer;
         private const float RefreshInterval = 2f;
         private bool _saveListDirty = true;
+        private bool _stopArmed;
+        private float _stopArmedTime;
 
         public bool IsVisible => _visible;
 
@@ -102,6 +107,7 @@ namespace MineMogulMultiplayer.UI
             if (_canvas == null) return;
             _visible = false;
             _canvas.gameObject.SetActive(false);
+            ResetStopButton();
         }
 
         public void Toggle()
@@ -125,6 +131,10 @@ namespace MineMogulMultiplayer.UI
                 _debugOverlayText.text = _session.GetDebugInfo();
 
             if (!_visible) return;
+
+            // Auto-reset stop confirmation after 3 seconds
+            if (_stopArmed && Time.unscaledTime - _stopArmedTime > 3f)
+                ResetStopButton();
 
             _refreshTimer += Time.unscaledDeltaTime;
             if (_refreshTimer >= RefreshInterval)
@@ -437,25 +447,25 @@ namespace MineMogulMultiplayer.UI
             _debugBotBtnLabel = _debugBotBtn.GetComponentInChildren<TextMeshProUGUI>();
             _debugBotBtn.onClick.AddListener(OnDebugBotPressed);
 
-            // Force Resync button
-            var resyncBtn = UIFactory.CreateButton(rt, "ResyncBtn", "Force Resync",
+            // Force Resync button (host only)
+            _resyncBtn = UIFactory.CreateButton(rt, "ResyncBtn", "Force Resync",
                 new Color(0.35f, 0.30f, 0.18f, 1f), 11, 26);
-            resyncBtn.onClick.AddListener(OnForceResyncPressed);
+            _resyncBtn.onClick.AddListener(OnForceResyncPressed);
 
-            // Dump Snapshot button
-            var dumpBtn = UIFactory.CreateButton(rt, "DumpBtn", "Dump Snapshot to Log",
+            // Dump Snapshot button (host only)
+            _dumpBtn = UIFactory.CreateButton(rt, "DumpBtn", "Dump Snapshot to Log",
                 new Color(0.35f, 0.30f, 0.18f, 1f), 11, 26);
-            dumpBtn.onClick.AddListener(OnDumpSnapshotPressed);
+            _dumpBtn.onClick.AddListener(OnDumpSnapshotPressed);
 
             // Toggle overlay button
             var overlayBtn = UIFactory.CreateButton(rt, "OverlayBtn", "Toggle Stats Overlay (F10)",
                 new Color(0.35f, 0.30f, 0.18f, 1f), 11, 26);
             overlayBtn.onClick.AddListener(ToggleDebugOverlay);
 
-            // Add Money button — useful for testing purchases in multiplayer
-            var moneyBtn = UIFactory.CreateButton(rt, "MoneyBtn", "Add $1000",
+            // Add Money button — useful for testing purchases in multiplayer (host only)
+            _moneyBtn = UIFactory.CreateButton(rt, "MoneyBtn", "Add $1000",
                 new Color(0.18f, 0.42f, 0.18f, 1f), 11, 26);
-            moneyBtn.onClick.AddListener(OnAddMoneyPressed);
+            _moneyBtn.onClick.AddListener(OnAddMoneyPressed);
 
             // Live debug info text
             UIFactory.AddSpacer(rt, 2);
@@ -489,8 +499,11 @@ namespace MineMogulMultiplayer.UI
             var text = _steamIdInput.text.Trim();
             if (ulong.TryParse(text, out ulong steamId))
             {
-                _session.JoinLobbyByHostId(steamId, _cfgPlayerName.Value);
-                _offlineStatus.text = $"Searching for lobby...";
+                _offlineStatus.text = "Searching for lobby...";
+                _session.JoinLobbyByHostId(steamId, _cfgPlayerName.Value, (msg) =>
+                {
+                    if (_offlineStatus != null) _offlineStatus.text = msg;
+                });
             }
             else
             {
@@ -521,8 +534,25 @@ namespace MineMogulMultiplayer.UI
 
         private void OnStopPressed()
         {
+            if (!_stopArmed)
+            {
+                _stopArmed = true;
+                _stopArmedTime = Time.unscaledTime;
+                var label = _stopBtn.GetComponentInChildren<TextMeshProUGUI>();
+                if (label != null) label.text = "Are you sure? Click again to disconnect";
+                return;
+            }
+            _stopArmed = false;
             _session?.Stop();
+            ResetStopButton();
             RefreshAll();
+        }
+
+        private void ResetStopButton()
+        {
+            _stopArmed = false;
+            var label = _stopBtn?.GetComponentInChildren<TextMeshProUGUI>();
+            if (label != null) label.text = "Disconnect / Stop";
         }
 
         private void OnDebugBotPressed()
@@ -594,8 +624,18 @@ namespace MineMogulMultiplayer.UI
         private void UpdateDebugBotButton()
         {
             if (_debugBotBtnLabel == null || _session == null) return;
-            _debugBotBtnLabel.text = _session.IsDebugBotActive ? "Remove Test Bot" : "Spawn Test Bot";
+            if (!_session.IsDebugBotActive)
+                _debugBotBtnLabel.text = "Spawn Test Bot (F8)";
+            else if (_session.IsDebugBotMirrorMode && _session.IsDebugBotStatic)
+                _debugBotBtnLabel.text = "Bot: Static \u2192 Mirror (F8)";
+            else if (_session.IsDebugBotMirrorMode)
+                _debugBotBtnLabel.text = "Bot: Mirror \u2192 Cycle (F8)";
+            else
+                _debugBotBtnLabel.text = "Bot: Cycle \u2192 Off (F8)";
         }
+
+        /// <summary>Called by Plugin when F8 is pressed to refresh the button state.</summary>
+        public void RefreshDebugBotButton() => UpdateDebugBotButton();
 
         private void OnSaveSelected(string fullFilePath, string levelId)
         {
@@ -624,9 +664,16 @@ namespace MineMogulMultiplayer.UI
 
         private void JoinFriend(ulong steamId)
         {
-            if (_session == null || !_session.SteamReady) return;
-            _session.JoinLobbyByHostId(steamId, _cfgPlayerName.Value);
-            _offlineStatus.text = $"Searching for lobby...";
+            if (_session == null || !_session.SteamReady)
+            {
+                _offlineStatus.text = "<color=#CC4444>Steam not connected.</color>";
+                return;
+            }
+            _offlineStatus.text = "Searching for lobby...";
+            _session.JoinLobbyByHostId(steamId, _cfgPlayerName.Value, (msg) =>
+            {
+                if (_offlineStatus != null) _offlineStatus.text = msg;
+            });
         }
 
         // ── Event callbacks ──
@@ -681,6 +728,12 @@ namespace MineMogulMultiplayer.UI
                 _inGameStatus.text = isHost
                     ? $"<color=#{ColorUtility.ToHtmlStringRGB(UIFactory.StatusGreen)}>HOSTING</color>"
                     : $"<color=#{ColorUtility.ToHtmlStringRGB(UIFactory.FriendOnline)}>CONNECTED</color>  as client";
+
+                // Hide host-only debug tools for clients
+                if (_resyncBtn != null) _resyncBtn.gameObject.SetActive(isHost);
+                if (_dumpBtn != null) _dumpBtn.gameObject.SetActive(isHost);
+                if (_moneyBtn != null) _moneyBtn.gameObject.SetActive(isHost);
+                if (_debugBotBtn != null) _debugBotBtn.gameObject.SetActive(isHost);
 
                 // Update debug info in panel
                 UpdateDebugBotButton();

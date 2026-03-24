@@ -1,6 +1,8 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using BepInEx.Logging;
 using MineMogulMultiplayer.Models;
@@ -30,8 +32,8 @@ namespace MineMogulMultiplayer.Core
         // Cached PlayerController to avoid expensive FindFirstObjectByType every tick
         private PlayerController _cachedPlayerController;
 
-        private const int HashCheckInterval = 600;
-        private const int ConsecutiveDesyncThreshold = 3;
+        private const int HashCheckInterval = 1200; // ~60s at 20 tps
+        private const int ConsecutiveDesyncThreshold = 5;
         private int _consecutiveDesyncCount;
 
         public bool SteamReady { get; private set; }
@@ -102,6 +104,10 @@ namespace MineMogulMultiplayer.Core
         // ── Crate position sync ──
         private readonly Dictionary<int, Vector3> _lastSentCratePositions = new Dictionary<int, Vector3>();
         private readonly List<CratePositionUpdate> _poolCratePositionUpdates = new List<CratePositionUpdate>();
+        // Host-side guard against transient empty-tool packets that cause remote flicker.
+        private readonly Dictionary<int, string> _hostLastToolByPlayerId = new Dictionary<int, string>();
+        private readonly Dictionary<int, int> _hostEmptyToolTicksByPlayerId = new Dictionary<int, int>();
+        private const int HostToolEmptyDebounce = 24;
         // Cached crate lookup for ApplyClientCratePositions (cleared each tick)
         private Dictionary<int, BreakableCrate> _cachedCrateLookup;
         // Cached building lookup for BuildDirtyBuildings (cleared each tick)
@@ -122,8 +128,21 @@ namespace MineMogulMultiplayer.Core
         private static readonly string[] DebugBotTools = new[]
         {
             "PickaxeBasic", "HammerBasic", "JackHammer", "ToolBuilder", "HardHat",
-            "MiningHelmet", "MagnetTool", "WrenchTool", "IngotMold", null // null = empty-handed
+            "MiningHelmet", "MagnetTool", "WrenchTool", "IngotMold", "GearMold",
+            "DoubleIngotMold", "Lantern", "ResourceScannerTool",
+            "RapidAutoMinerStandardDrillBit", "RapidAutoMinerTurboDrillBit",
+            "RapidAutoMinerHardenedDrillBit", null // null = empty-handed
         };
+        /// <summary>When true, bot mirrors local player's equipment instead of cycling.</summary>
+        private bool _debugBotMirrorMode = true;
+        /// <summary>When true, the bot stands still in front of the player instead of circling.</summary>
+        private bool _debugBotStatic = true;
+        /// <summary>True when the bot was spawned in solo mode (no real session). We manage our own player list.</summary>
+        private bool _debugBotSoloMode;
+        /// <summary>Bot's own sticky tool name — never expires, only replaced by a valid tool.</summary>
+        private string _debugBotLastTool;
+        /// <summary>True once the audit has run for this boot (avoid spamming logs).</summary>
+        private bool _debugBotAuditDone;
 
         // ── Steam Lobby (for invites & friend joining) ──
         private Steamworks.Data.Lobby? _lobby;
@@ -574,22 +593,29 @@ namespace MineMogulMultiplayer.Core
         }
 
         /// <summary>Client joins an existing lobby by host Steam ID or lobby.</summary>
-        public async void JoinLobbyByHostId(ulong hostSteamId, string playerName)
+        public async void JoinLobbyByHostId(ulong hostSteamId, string playerName, Action<string> statusCallback = null)
         {
-            if (!SteamReady) { _log.LogError("[Session] Steam not ready"); return; }
-            if (Phase != LobbyPhase.None) { _log.LogWarning("[Session] Already in a lobby"); return; }
+            if (!SteamReady)
+            {
+                _log.LogError("[Session] Steam not ready");
+                statusCallback?.Invoke("<color=#CC4444>Steam not connected.</color>");
+                return;
+            }
+            if (Phase != LobbyPhase.None)
+            {
+                _log.LogWarning("[Session] Already in a lobby");
+                statusCallback?.Invoke("<color=#CC4444>Already in a lobby.</color>");
+                return;
+            }
 
             _pendingPlayerName = playerName;
             _lobbyHostId = hostSteamId;
 
-            // We need to find the lobby. Use Steam friend lobby joining.
-            // Set up for when the lobby invite arrives or user joins directly
             _log.LogInfo($"[Session] Looking for lobby hosted by {hostSteamId}...");
+            statusCallback?.Invoke("Searching for lobby...");
 
-            // Try to get the lobby via friend game info
             try
             {
-                // Search for lobbies with matching host
                 var list = await SteamMatchmaking.LobbyList
                     .FilterDistanceWorldwide()
                     .WithKeyValue("mod", PluginInfo.GUID)
@@ -605,9 +631,9 @@ namespace MineMogulMultiplayer.Core
                         _lobby = lobby;
                         Phase = LobbyPhase.InLobby;
                         _log.LogInfo($"[Session] Joined lobby {lobby.Id}");
+                        statusCallback?.Invoke($"<color=#66CC66>Joined lobby!</color>");
                         RefreshLobbyPlayers();
 
-                        // Check if host already launched
                         var state = lobby.GetData("state");
                         if (state == "launching" || state == "ingame")
                         {
@@ -617,16 +643,19 @@ namespace MineMogulMultiplayer.Core
                     else
                     {
                         _log.LogError($"[Session] Failed to join lobby: {joinResult}");
+                        statusCallback?.Invoke($"<color=#CC4444>Failed to join: {joinResult}</color>");
                     }
                 }
                 else
                 {
                     _log.LogWarning("[Session] No lobby found — try using Steam invite instead");
+                    statusCallback?.Invoke("<color=#CC4444>No lobby found. Ask the host to send a Steam invite.</color>");
                 }
             }
             catch (Exception ex)
             {
                 _log.LogError($"[Session] JoinLobbyByHostId error: {ex.Message}");
+                statusCallback?.Invoke($"<color=#CC4444>Error: {ex.Message}</color>");
             }
         }
 
@@ -1323,27 +1352,35 @@ namespace MineMogulMultiplayer.Core
 
             if (_net != null && _net.IsRunning)
             {
-                if (_cachedPlayerController == null)
-                    _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
-                if (_cachedPlayerController != null)
+                if (TryGetLocalPlayerPose(out var pos, out var rot, out var pc))
                 {
+                    string heldId = null;
+                    var heldPos = default(NetVector3);
+                    var heldRot = default(NetQuaternion);
+                    if (pc != null)
+                        TryGetHeldObjectState(pc, out heldId, out heldPos, out heldRot);
+
                     _net.SendToHost(MessageType.PlayerInput, new PlayerInputMessage
                     {
                         PlayerId = MultiplayerState.LocalPlayerId,
-                        Position = new NetVector3(_cachedPlayerController.transform.position),
-                        Rotation = new NetQuaternion(_cachedPlayerController.transform.rotation),
-                        Sprinting = GetSprintState(_cachedPlayerController),
+                        Position = new NetVector3(pos),
+                        Rotation = new NetQuaternion(rot),
+                        Sprinting = pc != null && GetSprintState(pc),
                         ClientTick = _tick,
-                        EquippedTool = GetEquippedToolName(_cachedPlayerController),
-                        IsCrouching = GetCrouchState(_cachedPlayerController)
+                        EquippedTool = pc != null ? GetEquippedToolName(pc) : _lastValidToolName,
+                        IsCrouching = pc != null && GetCrouchState(pc),
+                        HeldObjectId = heldId,
+                        HeldObjectPosition = heldPos,
+                        HeldObjectRotation = heldRot
                     });
 
                     // Send position updates for ores the client is holding/moving
-                    SendClientOrePositions(_cachedPlayerController);
+                    if (pc != null)
+                        SendClientOrePositions(pc);
                 }
                 else if (_tick % 40 == 0) // Log every 2 seconds if controller is missing
                 {
-                    _log.LogWarning("[Session] PlayerController not found — cannot send position");
+                    _log.LogWarning("[Session] Local player transform not found — cannot send position");
                 }
             }
 
@@ -1472,15 +1509,22 @@ namespace MineMogulMultiplayer.Core
             var hostPlayer = _players.Find(p => p.PlayerId == 0);
             if (hostPlayer == null) return;
 
-            if (_cachedPlayerController == null)
-                _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
-            var pc = _cachedPlayerController;
-            if (pc != null)
+            if (TryGetLocalPlayerPose(out var pos, out var rot, out var pc))
             {
-                hostPlayer.Position = new NetVector3(pc.transform.position);
-                hostPlayer.Rotation = new NetQuaternion(pc.transform.rotation);
-                hostPlayer.EquippedTool = GetEquippedToolName(pc);
-                hostPlayer.IsCrouching = GetCrouchState(pc);
+                hostPlayer.Position = new NetVector3(pos);
+                hostPlayer.Rotation = new NetQuaternion(rot);
+                hostPlayer.EquippedTool = pc != null ? GetEquippedToolName(pc) : _lastValidToolName;
+                hostPlayer.IsCrouching = pc != null && GetCrouchState(pc);
+                if (pc != null && TryGetHeldObjectState(pc, out var heldId, out var heldPos, out var heldRot))
+                {
+                    hostPlayer.HeldObjectId = heldId;
+                    hostPlayer.HeldObjectPosition = heldPos;
+                    hostPlayer.HeldObjectRotation = heldRot;
+                }
+                else
+                {
+                    hostPlayer.HeldObjectId = null;
+                }
             }
 
             var eco = Singleton<EconomyManager>.Instance;
@@ -1500,18 +1544,68 @@ namespace MineMogulMultiplayer.Core
             try
             {
                 var inv = pc.GetComponent<PlayerInventory>();
-                if (inv == null) return _lastValidToolName;
-                var tool = inv.ActiveTool;
-                if (tool == null)
+                if (inv == null)
+                    return _lastValidToolName;
+
+                string name = null;
+
+                // Primary source: ActiveTool
+                try { name = TryGetToolIdFromAny(inv.ActiveTool); } catch { /* ignore */ }
+
+                // Reflection fallback: different game builds may rename the active tool slot.
+                if (string.IsNullOrEmpty(name))
+                    name = TryGetToolIdFromMember(inv, "CurrentTool")
+                        ?? TryGetToolIdFromMember(inv, "SelectedTool")
+                        ?? TryGetToolIdFromMember(inv, "ActiveItem")
+                        ?? TryGetToolIdFromMember(inv, "CurrentItem")
+                        ?? TryGetToolIdFromMember(inv, "SelectedItem")
+                        ?? TryGetToolIdFromMember(inv, "HeldTool");
+
+                // Last fallback: some builds expose currently held object on PlayerController.
+                // Skip physics-holdable objects (crates) — those are tracked via HeldObjectId, not EquippedTool.
+                if (string.IsNullOrEmpty(name))
                 {
-                    // Debounce: only clear after several consecutive null ticks
+                    try
+                    {
+                        var heldName = TryGetToolIdFromAny(pc.HeldObject);
+                        if (!string.IsNullOrEmpty(heldName) &&
+                            !heldName.StartsWith("BreakableCrate", System.StringComparison.OrdinalIgnoreCase))
+                            name = heldName;
+                    }
+                    catch { /* ignore */ }
+                }
+
+                // Deep reflection fallback for game-version variance.
+                if (string.IsNullOrEmpty(name))
+                {
+                    name = TryScanMembersForToolId(inv, 2);
+                    if (string.IsNullOrEmpty(name))
+                        name = TryScanMembersForToolId(pc, 2);
+                }
+
+                // Deterministic fallback: resolve from inventory list + selected index fields.
+                if (string.IsNullOrEmpty(name))
+                    name = TryGetToolIdFromInventorySelection(inv);
+
+                // Last deterministic fallback: if pickaxe exists in inventory, prefer it over empty.
+                if (string.IsNullOrEmpty(name))
+                    name = TryGetDefaultToolIdFromInventory(inv);
+
+                if (string.IsNullOrEmpty(name))
+                {
+                    // Keep last known valid tool to avoid remote visual flicker/disappear
+                    // when the game temporarily reports no active tool.
                     _toolNullTicks++;
-                    if (_toolNullTicks >= ToolNullDebounce)
-                        _lastValidToolName = null;
+                    if (_tick % 180 == 0)
+                    {
+                        string heldType = null;
+                        try { heldType = pc?.HeldObject?.GetType().Name; } catch { }
+                        _log.LogWarning($"[Session] Unable to resolve equipped tool (invType={inv.GetType().Name}, heldType={heldType ?? "null"})");
+                    }
                     return _lastValidToolName;
                 }
+
                 _toolNullTicks = 0;
-                var name = tool.SavableObjectID.ToString();
                 _lastValidToolName = name;
                 // Periodic debug log every ~15 seconds (300 ticks at 20tps)
                 if (_tick % 300 == 0)
@@ -1519,6 +1613,568 @@ namespace MineMogulMultiplayer.Core
                 return name;
             }
             catch { return _lastValidToolName; }
+        }
+
+        /// <summary>Try to read SavableObjectID-like value from an object using common field/property names.</summary>
+        private static string TryGetToolIdFromAny(object obj)
+        {
+            if (obj == null) return null;
+
+            if (obj is string s)
+                return NormalizeToolId(s);
+
+            if (obj is GameObject go)
+            {
+                var id = TryGetToolIdFromGameObject(go);
+                if (!string.IsNullOrEmpty(id)) return id;
+
+                var rb = go.GetComponent<Rigidbody>() ?? go.GetComponentInParent<Rigidbody>();
+                if (rb != null)
+                {
+                    id = TryGetToolIdFromGameObject(rb.gameObject);
+                    if (!string.IsNullOrEmpty(id)) return id;
+                }
+            }
+
+            if (obj is Component comp)
+            {
+                var idFromComp = TryGetToolIdFromComponent(comp);
+                if (!string.IsNullOrEmpty(idFromComp)) return idFromComp;
+
+                var id = TryGetToolIdFromGameObject(comp.gameObject);
+                if (!string.IsNullOrEmpty(id)) return id;
+
+                var rb = comp.GetComponentInParent<Rigidbody>();
+                if (rb != null)
+                {
+                    id = TryGetToolIdFromGameObject(rb.gameObject);
+                    if (!string.IsNullOrEmpty(id)) return id;
+                }
+            }
+
+            var type = obj.GetType();
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            // Most game tool objects expose SavableObjectID directly.
+            foreach (var propName in SavableIdMemberNames)
+            {
+                var p = type.GetProperty(propName, flags);
+                if (p == null || !p.CanRead) continue;
+                try
+                {
+                    var val = p.GetValue(obj);
+                    var norm = NormalizeToolId(val?.ToString());
+                    if (!string.IsNullOrEmpty(norm)) return norm;
+                }
+                catch { }
+            }
+
+            foreach (var fieldName in SavableIdMemberNames)
+            {
+                var f = type.GetField(fieldName, flags);
+                if (f == null) continue;
+                try
+                {
+                    var val = f.GetValue(obj);
+                    var norm = NormalizeToolId(val?.ToString());
+                    if (!string.IsNullOrEmpty(norm)) return norm;
+                }
+                catch { }
+            }
+
+            // Method fallback used by several save-loadable game objects.
+            try
+            {
+                var m = type.GetMethod("GetSavableObjectID", flags, null, Type.EmptyTypes, null);
+                if (m != null)
+                {
+                    var val = m.Invoke(obj, null);
+                    var norm = NormalizeToolId(val?.ToString());
+                    if (!string.IsNullOrEmpty(norm)) return norm;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        /// <summary>Try reading SavableObjectID from any component on a GameObject.</summary>
+        private static string TryGetToolIdFromGameObject(GameObject go)
+        {
+            if (go == null) return null;
+
+            // Check the exact object first.
+            var comps = go.GetComponents<Component>();
+            foreach (var c in comps)
+            {
+                if (c == null) continue;
+                var id = TryGetToolIdFromComponent(c);
+                if (!string.IsNullOrEmpty(id)) return id;
+            }
+
+            // Grabs often target a child collider. Walk parents to find the actual tool/object component.
+            var parentComps = go.GetComponentsInParent<Component>(true);
+            foreach (var c in parentComps)
+            {
+                if (c == null) continue;
+                var id = TryGetToolIdFromComponent(c);
+                if (!string.IsNullOrEmpty(id)) return id;
+            }
+            return null;
+        }
+
+        private static readonly string[] SavableIdMemberNames =
+        {
+            "SavableObjectID", "savableObjectID", "SavableObjectId", "savableObjectId"
+        };
+
+        private static string TryGetToolIdFromComponent(Component comp)
+        {
+            if (comp == null) return null;
+            var t = comp.GetType();
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            foreach (var propName in SavableIdMemberNames)
+            {
+                var p = t.GetProperty(propName, flags);
+                if (p == null || !p.CanRead) continue;
+                try
+                {
+                    var val = p.GetValue(comp);
+                    var norm = NormalizeToolId(val?.ToString());
+                    if (!string.IsNullOrEmpty(norm)) return norm;
+                }
+                catch { }
+            }
+
+            foreach (var fieldName in SavableIdMemberNames)
+            {
+                var f = t.GetField(fieldName, flags);
+                if (f == null) continue;
+                try
+                {
+                    var val = f.GetValue(comp);
+                    var norm = NormalizeToolId(val?.ToString());
+                    if (!string.IsNullOrEmpty(norm)) return norm;
+                }
+                catch { }
+            }
+
+            try
+            {
+                var m = t.GetMethod("GetSavableObjectID", flags, null, Type.EmptyTypes, null);
+                if (m != null)
+                {
+                    var val = m.Invoke(comp, null);
+                    var norm = NormalizeToolId(val?.ToString());
+                    if (!string.IsNullOrEmpty(norm)) return norm;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        /// <summary>Try reading a member value from source and then extracting a tool ID from it.</summary>
+        private static string TryGetToolIdFromMember(object source, string memberName)
+        {
+            if (source == null || string.IsNullOrEmpty(memberName)) return null;
+            var t = source.GetType();
+
+            var p = t.GetProperty(memberName);
+            if (p != null)
+            {
+                var val = p.GetValue(source);
+                var tool = TryGetToolIdFromAny(val);
+                if (!string.IsNullOrEmpty(tool)) return tool;
+            }
+
+            var f = t.GetField(memberName);
+            if (f != null)
+            {
+                var val = f.GetValue(source);
+                var tool = TryGetToolIdFromAny(val);
+                if (!string.IsNullOrEmpty(tool)) return tool;
+            }
+
+            return null;
+        }
+
+        /// <summary>Shallow recursive scan of likely members to find a SavableObjectID-like value.</summary>
+        private static string TryScanMembersForToolId(object source, int depth)
+        {
+            if (source == null || depth < 0) return null;
+
+            // Fast path on the object itself.
+            var direct = TryGetToolIdFromAny(source);
+            if (!string.IsNullOrEmpty(direct)) return direct;
+
+            var t = source.GetType();
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            foreach (var p in t.GetProperties(flags))
+            {
+                if (!p.CanRead || p.GetIndexParameters().Length > 0) continue;
+                if (!LooksLikeToolMember(p.Name)) continue;
+                try
+                {
+                    var val = p.GetValue(source);
+                    var id = TryGetToolIdFromAny(val);
+                    if (!string.IsNullOrEmpty(id)) return id;
+                    if (depth > 0)
+                    {
+                        id = TryScanMembersForToolId(val, depth - 1);
+                        if (!string.IsNullOrEmpty(id)) return id;
+                    }
+                }
+                catch { }
+            }
+
+            foreach (var f in t.GetFields(flags))
+            {
+                if (!LooksLikeToolMember(f.Name)) continue;
+                try
+                {
+                    var val = f.GetValue(source);
+                    var id = TryGetToolIdFromAny(val);
+                    if (!string.IsNullOrEmpty(id)) return id;
+                    if (depth > 0)
+                    {
+                        id = TryScanMembersForToolId(val, depth - 1);
+                        if (!string.IsNullOrEmpty(id)) return id;
+                    }
+                }
+                catch { }
+            }
+
+            return null;
+        }
+
+        private static bool LooksLikeToolMember(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            name = name.ToLowerInvariant();
+            return name.Contains("tool") || name.Contains("item") || name.Contains("held")
+                || name.Contains("active") || name.Contains("current") || name.Contains("selected")
+                || name.Contains("equip") || name.Contains("object");
+        }
+
+        /// <summary>Try reading the currently physics-held object (e.g. lantern/tool moved in world).</summary>
+        private static bool TryGetHeldObjectState(PlayerController pc, out string heldId, out NetVector3 heldPos, out NetQuaternion heldRot)
+        {
+            heldId = null;
+            heldPos = default;
+            heldRot = default;
+            if (pc == null) return false;
+
+            try
+            {
+                var heldObj = pc.HeldObject;
+                if (heldObj == null) return false;
+
+                heldId = TryGetToolIdFromAny(heldObj);
+                if (string.IsNullOrEmpty(heldId))
+                {
+                    // Fallback: use object name/type so we can still sync world-held movement
+                    // even if SavableObjectID isn't exposed on this build/object.
+                    heldId = TryGetHeldObjectFallbackId(heldObj);
+                }
+                if (string.IsNullOrEmpty(heldId)) return false;
+
+                var t = TryResolveHeldObjectTransform(heldObj);
+                if (t == null) return false;
+
+                heldPos = new NetVector3(t.position);
+                heldRot = new NetQuaternion(t.rotation);
+                return true;
+            }
+            catch
+            {
+                // Ignore and try reflection-based fallback below.
+            }
+
+            // Fallback: inspect PlayerInventory members for held/carried object references.
+            try
+            {
+                var inv = pc.GetComponent<PlayerInventory>();
+                if (inv != null && TryFindHeldObjectTransform(inv, out var t2, out heldId))
+                {
+                    heldPos = new NetVector3(t2.position);
+                    heldRot = new NetQuaternion(t2.rotation);
+                    return true;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        private static string TryGetToolIdFromInventorySelection(PlayerInventory inv)
+        {
+            if (inv == null) return null;
+
+            IList items = null;
+            try { items = inv.Items as IList; } catch { }
+            if (items == null || items.Count == 0) return null;
+
+            int? idx = TryGetIntMember(inv,
+                "SelectedToolIndex", "CurrentToolIndex", "ActiveToolIndex",
+                "selectedToolIndex", "currentToolIndex", "activeToolIndex",
+                "SelectedIndex", "CurrentIndex", "ActiveIndex",
+                "selectedIndex", "currentIndex", "activeIndex");
+
+            if (idx.HasValue && idx.Value >= 0 && idx.Value < items.Count)
+            {
+                var id = TryGetToolIdFromAny(items[idx.Value]);
+                if (!string.IsNullOrEmpty(id)) return id;
+            }
+
+            return null;
+        }
+
+        private static string TryGetDefaultToolIdFromInventory(PlayerInventory inv)
+        {
+            if (inv == null) return null;
+            IList items = null;
+            try { items = inv.Items as IList; } catch { }
+            if (items == null || items.Count == 0) return null;
+
+            // Prefer pickaxe if present (most common baseline tool).
+            foreach (var it in items)
+            {
+                var id = TryGetToolIdFromAny(it);
+                if (string.Equals(id, "PickaxeBasic", StringComparison.OrdinalIgnoreCase))
+                    return id;
+            }
+
+            // Otherwise first valid item.
+            foreach (var it in items)
+            {
+                var id = TryGetToolIdFromAny(it);
+                if (!string.IsNullOrEmpty(id)) return id;
+            }
+
+            return null;
+        }
+
+        private static int? TryGetIntMember(object source, params string[] names)
+        {
+            if (source == null || names == null) return null;
+            var t = source.GetType();
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            foreach (var n in names)
+            {
+                if (string.IsNullOrEmpty(n)) continue;
+                var p = t.GetProperty(n, flags);
+                if (p != null && p.CanRead)
+                {
+                    try
+                    {
+                        var v = p.GetValue(source);
+                        if (v is int pi) return pi;
+                    }
+                    catch { }
+                }
+
+                var f = t.GetField(n, flags);
+                if (f != null)
+                {
+                    try
+                    {
+                        var v = f.GetValue(source);
+                        if (v is int fi) return fi;
+                    }
+                    catch { }
+                }
+            }
+
+            return null;
+        }
+
+        private static bool TryFindHeldObjectTransform(object source, out Transform tr, out string id)
+        {
+            tr = null;
+            id = null;
+            if (source == null) return false;
+
+            var t = source.GetType();
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            foreach (var p in t.GetProperties(flags))
+            {
+                if (!p.CanRead || p.GetIndexParameters().Length > 0) continue;
+                if (!LooksLikeToolMember(p.Name)) continue;
+                object val;
+                try { val = p.GetValue(source); } catch { continue; }
+                if (val == null) continue;
+
+                var toolId = TryGetToolIdFromAny(val);
+                var tf = TryResolveHeldObjectTransform(val) ?? ExtractTransform(val);
+                if (!string.IsNullOrEmpty(toolId) && tf != null)
+                {
+                    tr = tf;
+                    id = toolId;
+                    return true;
+                }
+            }
+
+            foreach (var f in t.GetFields(flags))
+            {
+                if (!LooksLikeToolMember(f.Name)) continue;
+                object val;
+                try { val = f.GetValue(source); } catch { continue; }
+                if (val == null) continue;
+
+                var toolId = TryGetToolIdFromAny(val);
+                var tf = TryResolveHeldObjectTransform(val) ?? ExtractTransform(val);
+                if (!string.IsNullOrEmpty(toolId) && tf != null)
+                {
+                    tr = tf;
+                    id = toolId;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static Transform ExtractTransform(object obj)
+        {
+            if (obj == null) return null;
+            if (obj is GameObject go) return go.transform;
+            if (obj is Component c) return c.transform;
+
+            try
+            {
+                var tp = obj.GetType().GetProperty("transform") ?? obj.GetType().GetProperty("Transform");
+                if (tp != null) return tp.GetValue(obj) as Transform;
+            }
+            catch { }
+            return null;
+        }
+
+        private static Transform TryResolveHeldObjectTransform(object heldObj)
+        {
+            if (heldObj == null) return null;
+
+            if (heldObj is GameObject go)
+            {
+                var rb = go.GetComponent<Rigidbody>() ?? go.GetComponentInParent<Rigidbody>();
+                if (rb != null) return rb.transform;
+                return go.transform;
+            }
+
+            if (heldObj is Component comp)
+            {
+                var rb = comp.GetComponent<Rigidbody>() ?? comp.GetComponentInParent<Rigidbody>();
+                if (rb != null) return rb.transform;
+                return comp.transform;
+            }
+
+            return ExtractTransform(heldObj);
+        }
+
+        private static string TryGetHeldObjectFallbackId(object heldObj)
+        {
+            if (heldObj == null) return null;
+            try
+            {
+                if (heldObj is GameObject go)
+                {
+                    var extracted = TryGetToolIdFromGameObject(go);
+                    if (!string.IsNullOrEmpty(extracted)) return extracted;
+
+                    var rb = go.GetComponent<Rigidbody>() ?? go.GetComponentInParent<Rigidbody>();
+                    if (rb != null)
+                    {
+                        extracted = TryGetToolIdFromGameObject(rb.gameObject);
+                        if (!string.IsNullOrEmpty(extracted)) return extracted;
+                    }
+
+                    if (!string.IsNullOrEmpty(go.name)) return go.name;
+                }
+                if (heldObj is Component c)
+                {
+                    var extracted = TryGetToolIdFromComponent(c);
+                    if (!string.IsNullOrEmpty(extracted)) return extracted;
+
+                    var rb = c.GetComponent<Rigidbody>() ?? c.GetComponentInParent<Rigidbody>();
+                    if (rb != null)
+                    {
+                        extracted = TryGetToolIdFromGameObject(rb.gameObject);
+                        if (!string.IsNullOrEmpty(extracted)) return extracted;
+                    }
+
+                    if (c.gameObject != null && !string.IsNullOrEmpty(c.gameObject.name))
+                        return c.gameObject.name;
+                }
+                return NormalizeToolId(heldObj.GetType().Name);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string NormalizeToolId(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            var value = raw.Trim();
+            if (value.EndsWith("(Clone)", StringComparison.OrdinalIgnoreCase))
+                value = value.Substring(0, value.Length - "(Clone)".Length).Trim();
+            return string.IsNullOrEmpty(value) ? null : value;
+        }
+
+        /// <summary>
+        /// Resolve the local player's pose reliably across scene/state transitions.
+        /// Falls back to the main camera transform if PlayerController is temporarily unavailable.
+        /// </summary>
+        private bool TryGetLocalPlayerPose(out Vector3 position, out Quaternion rotation, out PlayerController pc)
+        {
+            if (_cachedPlayerController == null)
+                _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
+
+            pc = _cachedPlayerController;
+            if (pc != null)
+            {
+                var pcPos = pc.transform.position;
+                var pcRot = pc.transform.rotation;
+
+                // Some builds report a stale/default PlayerController transform on clients.
+                // If it looks invalid, fall back to camera pose so remote movement still updates.
+                var cam = Camera.main;
+                if (MultiplayerState.IsClient && cam != null)
+                {
+                    var camPos = cam.transform.position;
+                    bool pcLooksDefault = pcPos.sqrMagnitude < 0.25f && camPos.sqrMagnitude > 1f;
+                    bool pcTooFarFromCamera = Vector3.SqrMagnitude(pcPos - camPos) > 64f;
+                    if (pcLooksDefault || pcTooFarFromCamera)
+                    {
+                        if (_tick % 120 == 0)
+                            _log.LogWarning($"[Session] Using camera pose fallback for client movement (pc=({pcPos.x:F1},{pcPos.y:F1},{pcPos.z:F1}) cam=({camPos.x:F1},{camPos.y:F1},{camPos.z:F1}))");
+                        position = camPos;
+                        rotation = cam.transform.rotation;
+                        return true;
+                    }
+                }
+
+                position = pcPos;
+                rotation = pcRot;
+                return true;
+            }
+
+            var mainCam = Camera.main;
+            if (mainCam != null)
+            {
+                position = mainCam.transform.position;
+                rotation = mainCam.transform.rotation;
+                return true;
+            }
+
+            position = default;
+            rotation = default;
+            return false;
         }
 
         private static bool GetSprintState(PlayerController pc)
@@ -1857,8 +2513,48 @@ namespace MineMogulMultiplayer.Core
             if (player == null) return;
             player.Position = input.Position;
             player.Rotation = input.Rotation;
-            player.EquippedTool = input.EquippedTool;
+
+            var playerId = player.PlayerId;
+            var incomingTool = NormalizeToolId(input.EquippedTool);
+            var incomingHeld = NormalizeToolId(input.HeldObjectId);
+
+            // If explicit tool is empty while the player is grabbing a world object,
+            // prefer that object ID so remote visuals remain stable.
+            if (string.IsNullOrEmpty(incomingTool) && !string.IsNullOrEmpty(incomingHeld))
+                incomingTool = incomingHeld;
+
+            if (string.IsNullOrEmpty(incomingTool))
+            {
+                int emptyTicks = 0;
+                _hostEmptyToolTicksByPlayerId.TryGetValue(playerId, out emptyTicks);
+                emptyTicks++;
+                _hostEmptyToolTicksByPlayerId[playerId] = emptyTicks;
+
+                if (_hostLastToolByPlayerId.TryGetValue(playerId, out var lastTool) &&
+                    !string.IsNullOrEmpty(lastTool) &&
+                    emptyTicks < HostToolEmptyDebounce)
+                {
+                    player.EquippedTool = lastTool;
+                }
+                else
+                {
+                    player.EquippedTool = null;
+                }
+            }
+            else
+            {
+                _hostLastToolByPlayerId[playerId] = incomingTool;
+                _hostEmptyToolTicksByPlayerId[playerId] = 0;
+                player.EquippedTool = incomingTool;
+            }
+
             player.IsCrouching = input.IsCrouching;
+            player.HeldObjectId = incomingHeld;
+            player.HeldObjectPosition = input.HeldObjectPosition;
+            player.HeldObjectRotation = input.HeldObjectRotation;
+
+            if (_tick % 120 == 0)
+                _log.LogInfo($"[Session] Input P{clientId}: ({input.Position.X:F1},{input.Position.Y:F1},{input.Position.Z:F1}) tool='{player.EquippedTool}' held='{player.HeldObjectId}'");
         }
 
         private void HandlePlaceBuilding(uint clientId, PlaceBuildingMessage msg)
@@ -1936,20 +2632,34 @@ namespace MineMogulMultiplayer.Core
             _log.LogInfo($"[Session] Player {clientId} mining at {msg.NodePosition}");
             OreNode closest = null;
             float closestDist = float.MaxValue;
+            var nodePos = msg.NodePosition.ToUnity();
+            var hitPos = msg.HitPosition.ToUnity();
             foreach (var node in UnityEngine.Object.FindObjectsByType<OreNode>(FindObjectsSortMode.None))
             {
-                float dist = Vector3.Distance(node.transform.position, msg.NodePosition.ToUnity());
+                // Prefer matching by reported node position, but also consider hit position
+                // to tolerate small host/client transform drift.
+                float distNode = Vector3.Distance(node.transform.position, nodePos);
+                float distHit = Vector3.Distance(node.transform.position, hitPos);
+                float dist = Mathf.Min(distNode, distHit);
                 if (dist < closestDist)
                 {
                     closestDist = dist;
                     closest = node;
                 }
             }
-            if (closest != null && closestDist < 1f)
+            if (closest != null && closestDist < 3f)
             {
                 MiningPatch.NetworkBypass = true;
-                try { closest.TakeDamage(msg.Damage, msg.HitPosition.ToUnity()); }
+                try { closest.TakeDamage(msg.Damage, hitPos); }
                 finally { MiningPatch.NetworkBypass = false; }
+
+                // Host-applied remote mining must be explicitly rebroadcast to clients.
+                // Postfix broadcast is bypassed in this code path via NetworkBypass.
+                BroadcastMineNode(msg.NodePosition, msg.Damage, msg.HitPosition);
+            }
+            else
+            {
+                _log.LogWarning($"[Session] MineNode from player {clientId} had no nearby ore node (bestDist={closestDist:F2})");
             }
         }
 
@@ -3779,64 +4489,197 @@ namespace MineMogulMultiplayer.Core
 
         // ── Debug bot ─────────────────────────────────
 
-        /// <summary>Toggle a fake remote player for local testing. Host only.</summary>
+        /// <summary>
+        /// Toggle debug bot. Cycles: Off → Mirror → Cycle → Off.
+        /// Works without a full multiplayer session (solo debug mode).
+        /// </summary>
         public void ToggleDebugBot()
         {
-            if (!MultiplayerState.IsHost) return;
-
-            _debugBotActive = !_debugBotActive;
-            if (_debugBotActive)
+            if (_debugBotActive && _debugBotMirrorMode && _debugBotStatic)
             {
+                // Static Mirror → Moving Mirror
+                _debugBotStatic = false;
                 _debugBotAngle = 0f;
-                _players.Add(new PlayerState
-                {
-                    PlayerId = DebugBotPlayerId,
-                    DisplayName = "TestBot"
-                });
-                _log.LogInfo("[Session] Debug bot spawned");
-                LogEvent("Test bot joined.");
+                _log.LogInfo("[Session] Debug bot switched to MOVING MIRROR mode");
+                LogEvent("Test bot: moving mirror (circles you)");
+                return;
             }
-            else
+            else if (_debugBotActive && _debugBotMirrorMode && !_debugBotStatic)
             {
+                // Moving Mirror → Cycle
+                _debugBotMirrorMode = false;
+                _debugBotAngle = 0f;
+                _log.LogInfo("[Session] Debug bot switched to CYCLE mode");
+                LogEvent("Test bot: cycle mode (tools rotate every 4s)");
+                return;
+            }
+            else if (_debugBotActive && !_debugBotMirrorMode)
+            {
+                // Cycle → Off
+                _debugBotActive = false;
                 _players.RemoveAll(p => p.PlayerId == DebugBotPlayerId);
                 RemotePlayerManager.Clear();
-                // Re-push remaining players so host visual is correct
-                RemotePlayerManager.UpdatePlayers(_players, MultiplayerState.LocalPlayerId);
+                if (!_debugBotSoloMode)
+                    RemotePlayerManager.UpdatePlayers(_players, MultiplayerState.LocalPlayerId);
+                _debugBotSoloMode = false;
+                _debugBotLastTool = null;
                 _log.LogInfo("[Session] Debug bot removed");
                 LogEvent("Test bot left.");
+                return;
             }
+
+            // Off → Static Mirror (spawn)
+            _debugBotActive = true;
+            _debugBotMirrorMode = true;
+            _debugBotStatic = true;
+            _debugBotLastTool = null;
+            _debugBotAngle = 0f;
+
+            // If not in a session, set up solo mode so the bot still renders
+            bool inSession = MultiplayerState.IsOnline;
+            if (!inSession)
+            {
+                _debugBotSoloMode = true;
+                // Add a local player entry if not present
+                if (!_players.Exists(p => p.PlayerId == 0))
+                {
+                    _players.Add(new PlayerState
+                    {
+                        PlayerId = 0,
+                        DisplayName = "You"
+                    });
+                }
+            }
+
+            _players.Add(new PlayerState
+            {
+                PlayerId = DebugBotPlayerId,
+                DisplayName = "TestBot"
+            });
+            _log.LogInfo("[Session] Debug bot spawned in STATIC MIRROR mode" + (_debugBotSoloMode ? " (solo)" : ""));
+            LogEvent("Test bot joined (static mirror — stands in front of you).");
         }
 
         public bool IsDebugBotActive => _debugBotActive;
+        public bool IsDebugBotMirrorMode => _debugBotMirrorMode;
+        public bool IsDebugBotStatic => _debugBotStatic;
+        public string DebugBotModeName => !_debugBotActive ? "Off"
+            : (_debugBotMirrorMode && _debugBotStatic ? "Static"
+            : (_debugBotMirrorMode ? "Mirror" : "Cycle"));
 
         private void UpdateDebugBot()
         {
             var bot = _players.Find(p => p.PlayerId == DebugBotPlayerId);
             if (bot == null) return;
 
-            // Circle around the host player at radius 4, ~0.25 rev/sec
-            _debugBotAngle += 0.25f * (1f / 20f) * 2f * Mathf.PI; // 20 tps assumed
-            if (_debugBotAngle > 2f * Mathf.PI) _debugBotAngle -= 2f * Mathf.PI;
+            // Run tool prefab audit once on first bot tick
+            if (!_debugBotAuditDone)
+            {
+                _debugBotAuditDone = true;
+                RemotePlayerManager.AuditAllToolPrefabs();
+            }
+
+            // In solo mode, keep our local player entry up to date
+            if (_debugBotSoloMode)
+            {
+                var localPlayer = _players.Find(p => p.PlayerId == 0);
+                if (localPlayer != null && TryGetLocalPlayerPose(out var lPos, out var lRot, out var lPc))
+                {
+                    localPlayer.Position = new NetVector3(lPos);
+                    localPlayer.Rotation = new NetQuaternion(lRot);
+                }
+            }
 
             var hostPlayer = _players.Find(p => p.PlayerId == 0);
             var center = hostPlayer?.Position.ToUnity() ?? Vector3.zero;
-            bot.Position = new NetVector3(
-                center.x + Mathf.Cos(_debugBotAngle) * 4f,
-                center.y,
-                center.z + Mathf.Sin(_debugBotAngle) * 4f);
 
-            // Face the direction of movement
-            float nextAngle = _debugBotAngle + 0.05f;
-            var forward = new Vector3(
-                Mathf.Cos(nextAngle) * 4f - Mathf.Cos(_debugBotAngle) * 4f,
-                0,
-                Mathf.Sin(nextAngle) * 4f - Mathf.Sin(_debugBotAngle) * 4f);
-            if (forward.sqrMagnitude > 0.001f)
-                bot.Rotation = new NetQuaternion(Quaternion.LookRotation(forward));
+            if (_debugBotStatic)
+            {
+                // Static mode: place bot 3m in front of the player, facing the player
+                var hostRot = hostPlayer?.Rotation.ToUnity() ?? Quaternion.identity;
+                var forward = hostRot * Vector3.forward;
+                var botPos = center + forward * 3f;
+                bot.Position = new NetVector3(botPos);
+                // Face back toward the player
+                bot.Rotation = new NetQuaternion(Quaternion.LookRotation(-forward));
+            }
+            else
+            {
+                // Circle around the host player at radius 4, ~0.25 rev/sec
+                _debugBotAngle += 0.25f * (1f / 20f) * 2f * Mathf.PI; // 20 tps assumed
+                if (_debugBotAngle > 2f * Mathf.PI) _debugBotAngle -= 2f * Mathf.PI;
 
-            // Cycle through tools every 4 seconds so host can see all visuals
-            int toolIndex = ((int)(Time.time / 4f)) % DebugBotTools.Length;
-            bot.EquippedTool = DebugBotTools[toolIndex];
+                bot.Position = new NetVector3(
+                    center.x + Mathf.Cos(_debugBotAngle) * 4f,
+                    center.y,
+                    center.z + Mathf.Sin(_debugBotAngle) * 4f);
+
+                // Face the direction of movement
+                float nextAngle = _debugBotAngle + 0.05f;
+                var forward = new Vector3(
+                    Mathf.Cos(nextAngle) * 4f - Mathf.Cos(_debugBotAngle) * 4f,
+                    0,
+                    Mathf.Sin(nextAngle) * 4f - Mathf.Sin(_debugBotAngle) * 4f);
+                if (forward.sqrMagnitude > 0.001f)
+                    bot.Rotation = new NetQuaternion(Quaternion.LookRotation(forward));
+            }
+
+            // Equipment: mirror local player or cycle through preset list
+            if (_debugBotMirrorMode)
+            {
+                // Mirror: copy whatever the local player has equipped
+                if (TryGetLocalPlayerPose(out _, out _, out var pc) && pc != null)
+                {
+                    var resolvedTool = GetEquippedToolName(pc);
+                    // Use sticky debounce: only update if we got a valid tool name.
+                    // GetEquippedToolName often returns null due to API limitations.
+                    if (!string.IsNullOrEmpty(resolvedTool))
+                        _debugBotLastTool = resolvedTool;
+                    bot.EquippedTool = _debugBotLastTool;
+
+                    bot.IsCrouching = GetCrouchState(pc);
+                    if (TryGetHeldObjectState(pc, out var heldId, out var heldPos, out var heldRot))
+                    {
+                        bot.HeldObjectId = heldId;
+                        // Offset held object position to match bot's offset from player
+                        var playerPos = hostPlayer?.Position.ToUnity() ?? Vector3.zero;
+                        var botPos = bot.Position.ToUnity();
+                        var offset = botPos - playerPos;
+                        bot.HeldObjectPosition = new NetVector3(heldPos.ToUnity() + offset);
+                        bot.HeldObjectRotation = heldRot;
+                    }
+                    else
+                    {
+                        bot.HeldObjectId = null;
+                    }
+
+                    // Periodic diagnostic log every ~3 seconds
+                    if (_tick % 60 == 0)
+                        _log.LogInfo($"[DebugBot] Mirror: tool='{bot.EquippedTool}' heldObj='{bot.HeldObjectId}' crouch={bot.IsCrouching}");
+                }
+                else
+                {
+                    if (_tick % 60 == 0)
+                        _log.LogWarning("[DebugBot] Mirror: no PlayerController found");
+                }
+            }
+            else
+            {
+                // Cycle through tools every 4 seconds so host can see all visuals
+                int toolIndex = ((int)(Time.time / 4f)) % DebugBotTools.Length;
+                bot.EquippedTool = DebugBotTools[toolIndex];
+                bot.HeldObjectId = null;
+                bot.IsCrouching = false;
+            }
+        }
+
+        /// <summary>Tick only the debug bot visual system (for solo mode when not in a real session).</summary>
+        public void TickDebugBotOnly()
+        {
+            if (!_debugBotActive || !_debugBotSoloMode) return;
+            _tick++; // keep tick counter going for periodic logs
+            UpdateDebugBot();
+            RemotePlayerManager.UpdatePlayers(_players, 0);
         }
 
         // ── Lifecycle ────────────────────────────────
@@ -3856,6 +4699,8 @@ namespace MineMogulMultiplayer.Core
             _syncRetryCount = 0;
             _consecutiveDesyncCount = 0;
             _debugBotActive = false;
+            _debugBotSoloMode = false;
+            _debugBotLastTool = null;
             bool wasOnline = MultiplayerState.IsOnline || Phase != LobbyPhase.None;
             Phase = LobbyPhase.None;
             MultiplayerState.CurrentRole = MultiplayerState.Role.Offline;

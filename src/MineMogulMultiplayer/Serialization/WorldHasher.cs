@@ -21,7 +21,8 @@ namespace MineMogulMultiplayer.Serialization
                 bw.Write(snapshot.World.ResearchTickets);
 
                 WriteBuildings(bw, snapshot.Buildings);
-                WriteOreSummary(bw, snapshot.OrePieces);
+                // NOTE: Ore excluded from hash — ore counts fluctuate constantly as pieces
+                // spawn, fall, and get picked up. Including them causes perpetual false desyncs.
                 WriteSortedStrings(bw, snapshot.World.CompletedResearchIds);
                 WriteSortedStrings(bw, snapshot.World.CompletedQuestIds);
                 // NOTE: ActiveQuests excluded from hash — quest progress tracking diverges

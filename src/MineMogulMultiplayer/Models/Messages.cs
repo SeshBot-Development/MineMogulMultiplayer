@@ -67,6 +67,10 @@ namespace MineMogulMultiplayer.Models
         /// <summary>SavableObjectID name of the currently held tool, or null if empty-handed.</summary>
         [Key(5)] public string EquippedTool;
         [Key(6)] public bool IsCrouching;
+        /// <summary>SavableObjectID name of a physics-held world object (e.g. lantern), if any.</summary>
+        [Key(7)] public string HeldObjectId;
+        [Key(8)] public NetVector3 HeldObjectPosition;
+        [Key(9)] public NetQuaternion HeldObjectRotation;
     }
 
     [MessagePackObject]

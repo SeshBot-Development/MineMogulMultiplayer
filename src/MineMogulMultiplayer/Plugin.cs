@@ -39,9 +39,11 @@ namespace MineMogulMultiplayer
             // Keep the plugin alive across scene changes
             DontDestroyOnLoad(gameObject);
 
-            // Auto-update check (background thread, won't block startup)
+            // Synchronous update check — if an update is found, it downloads,
+            // extracts, and restarts the game automatically.
             var modDir = System.IO.Path.GetDirectoryName(Info.Location);
-            AutoUpdater.CheckInBackground(modDir, Core.PluginInfo.Version, Logger);
+            if (AutoUpdater.CheckAndApply(modDir, Core.PluginInfo.Version, Logger))
+                return; // Game is restarting, don't initialize anything
 
             // Config
             _cfgPlayerName = Config.Bind("Network", "PlayerName", "Player", "Display name in multiplayer.");
@@ -102,6 +104,13 @@ namespace MineMogulMultiplayer
 
         private void Update()
         {
+            // F8 — toggle debug test bot (works any time during gameplay)
+            if (Input.GetKeyDown(KeyCode.F8) && _session != null && _session.SteamReady)
+            {
+                _session.ToggleDebugBot();
+                MultiplayerPanel?.RefreshDebugBotButton();
+            }
+
             // Retry Steam init if it wasn't ready at startup (game may init Steam after us)
             if (!_session.SteamReady)
             {
@@ -123,7 +132,21 @@ namespace MineMogulMultiplayer
             catch { /* handled in Tick */ }
 
             // Only do full tick when in lobby, online, or relay socket is open (pending host)
-            if (!MultiplayerState.IsOnline && !_session.IsPendingHost && !_session.IsInLobby) return;
+            if (!MultiplayerState.IsOnline && !_session.IsPendingHost && !_session.IsInLobby)
+            {
+                // Solo debug bot: still tick and interpolate even when not in a real session
+                if (_session.IsDebugBotActive)
+                {
+                    RemotePlayerManager.Interpolate();
+                    _tickTimer += Time.deltaTime;
+                    if (_tickTimer >= _tickInterval)
+                    {
+                        _tickTimer -= _tickInterval;
+                        _session.TickDebugBotOnly();
+                    }
+                }
+                return;
+            }
 
             // Smooth interpolation for remote player visuals (every frame, only during gameplay)
             if (MultiplayerState.IsOnline)
