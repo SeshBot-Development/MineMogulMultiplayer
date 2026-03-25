@@ -21,6 +21,9 @@ namespace MineMogulMultiplayer
         private ConfigEntry<string> _cfgPlayerName;
         private ConfigEntry<int> _cfgTickRate;
 
+        /// <summary>The configured player display name (or Steam name).</summary>
+        public string PlayerName => _cfgPlayerName?.Value ?? "Player";
+
         // ── Runtime state ────────────────────────────
 
         private Harmony _harmony;
