@@ -169,6 +169,10 @@ namespace MineMogulMultiplayer.Core
         // Map clientId → SteamId for inventory tracking
         private readonly Dictionary<uint, ulong> _clientSteamIds = new Dictionary<uint, ulong>();
 
+        // ── Save-and-reload for mid-game joins ──
+        private bool _reloadingForJoin;   // true while reload is in progress — skip ticking
+        private int _reloadResyncFrames;  // countdown frames before sending fresh snapshots after reload
+
         // ── Steam Lobby (for invites & friend joining) ──
         private Steamworks.Data.Lobby? _lobby;
         public const int MaxPlayers = 4;
@@ -1005,6 +1009,13 @@ namespace MineMogulMultiplayer.Core
                 return;
             }
 
+            // Don't tick game state while save-and-reload for a new joiner is in progress
+            if (_reloadingForJoin)
+            {
+                _net?.Poll();
+                return;
+            }
+
             // Client connection timeout
             if (_clientWaitingForConnect)
             {
@@ -1036,6 +1047,20 @@ namespace MineMogulMultiplayer.Core
             _net?.Poll();
 
             if (!IsGameSceneReady()) return;
+
+            // After a save-reload for a new joiner, wait a few frames then send fresh snapshots
+            if (_reloadResyncFrames > 0)
+            {
+                _reloadResyncFrames--;
+                if (_reloadResyncFrames == 0)
+                {
+                    InitializeKnownOres();
+                    var snapshot = BuildSnapshot();
+                    _net.SendToAll(MessageType.FullSnapshot, snapshot);
+                    _log.LogInfo("[Session] Post-reload resync: sent fresh snapshot to all clients");
+                }
+                return;
+            }
 
             // Send deferred snapshots to clients who were accepted while scene was briefly unavailable
             if (_pendingSnapshotClients.Count > 0)
@@ -5645,6 +5670,58 @@ namespace MineMogulMultiplayer.Core
             LogEvent($"Kicked {name}");
         }
 
+        /// <summary>
+        /// Save the current game, reload it in-place, and reinitialise ores so a newly-joined
+        /// player receives a clean snapshot.  Host only, called from OnLobbyMemberJoined.
+        /// </summary>
+        private void SaveAndReloadForNewPlayer(string playerName)
+        {
+            _reloadingForJoin = true;
+            try
+            {
+                var slm = Singleton<SavingLoadingManager>.Instance;
+                if (slm == null)
+                {
+                    _log.LogError("[Session] SavingLoadingManager not found — cannot save-reload for join");
+                    _reloadingForJoin = false;
+                    return;
+                }
+
+                // 1. Save current game
+                slm.SaveGameWithActiveSaveFileName();
+                SaveMultiplayerCompanionData();
+                _log.LogInfo($"[Session] Saved game for mid-game join by {playerName}");
+
+                // 2. Determine full path (SaveGame uses ActiveSaveFileName; build the path)
+                string fullPath = _hostSaveFilePath;
+                if (string.IsNullOrEmpty(fullPath))
+                {
+                    fullPath = SavingLoadingManager.GetFullSaveFilePath(slm.ActiveSaveFileName);
+                    _hostSaveFilePath = fullPath;
+                }
+
+                // 3. Reload in-place (destroys all ISaveLoadableObject + ores, recreates from save)
+                slm.LoadGame(fullPath);
+                _log.LogInfo("[Session] Reloaded save in-place for new player join");
+
+                // 4. Reinitialise ore tracking — old instanceIDs are gone after reload
+                InitializeKnownOres();
+
+                // 5. Wait a few frames for physics to settle, then send fresh snapshots
+                _reloadResyncFrames = 5;
+
+                LogEvent($"{playerName} joining — world reloaded.");
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"[Session] SaveAndReloadForNewPlayer failed: {ex}");
+            }
+            finally
+            {
+                _reloadingForJoin = false;
+            }
+        }
+
         /// <summary>Get the dictionary of connected client IDs to names. Host only.</summary>
         public IReadOnlyDictionary<uint, string> ConnectedClients => _clientNames;
 
@@ -5966,6 +6043,8 @@ namespace MineMogulMultiplayer.Core
             _savedPlayerInventories.Clear();
             _clientSteamIds.Clear();
             _hostSaveFilePath = null;
+            _reloadingForJoin = false;
+            _reloadResyncFrames = 0;
             LobbyPlayerNames.Clear();
             RemotePlayerManager.Clear();
             _log.LogInfo("[Session] Stopped");
@@ -6017,6 +6096,12 @@ namespace MineMogulMultiplayer.Core
         {
             _log.LogInfo($"[Session] {friend.Name} joined the lobby");
             RefreshLobbyPlayers();
+
+            // If we're the host and in-game, save and reload so the new player gets a clean world
+            if (Phase == LobbyPhase.InGame && MultiplayerState.IsHost && !_reloadingForJoin)
+            {
+                SaveAndReloadForNewPlayer(friend.Name);
+            }
         }
 
         private void OnLobbyMemberLeave(Steamworks.Data.Lobby lobby, Friend friend)
