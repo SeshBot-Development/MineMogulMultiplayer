@@ -57,9 +57,12 @@ Copy-Item "$GameDir\BepInEx\config\BepInEx.cfg" "$cfgStage\BepInEx.cfg"
 New-Item -ItemType Directory -Path "$stageDir\BepInEx\plugins\MineMogulMultiplayer" | Out-Null
 New-Item -ItemType Directory -Path "$stageDir\BepInEx\patchers" | Out-Null
 
-# 8. Copy mod DLL
+# 8. Copy all mod DLLs (mod + dependencies like Steamworks, MessagePack, System.*)
+Copy-Item "$GameDir\BepInEx\plugins\MineMogulMultiplayer\*.dll" `
+    "$stageDir\BepInEx\plugins\MineMogulMultiplayer\" -Force
+# Overwrite mod DLL with freshly built version
 Copy-Item "bin\$Configuration\net472\MineMogulMultiplayer.dll" `
-    "$stageDir\BepInEx\plugins\MineMogulMultiplayer\MineMogulMultiplayer.dll"
+    "$stageDir\BepInEx\plugins\MineMogulMultiplayer\MineMogulMultiplayer.dll" -Force
 
 # 9. Create ZIP
 $zipPath = "bin\$Configuration\MineMogulMultiplayer-v$version.zip"
