@@ -66,9 +66,12 @@ namespace MineMogulMultiplayer.Core
         // ── Ore network ID tracking (host only) ──
         private int _nextOreNetId = 1;
         private readonly Dictionary<int, int> _hostOreInstanceToNetId = new Dictionary<int, int>(); // hostInstanceId → netId
+        private readonly Dictionary<int, OrePiece> _hostNetIdToOre = new Dictionary<int, OrePiece>(); // netId → OrePiece (reverse lookup)
+        private readonly Dictionary<int, Rigidbody> _oreRigidbodyCache = new Dictionary<int, Rigidbody>(); // netId → cached Rigidbody
 
         // ── Client ore tracking ──
         private readonly Dictionary<int, OrePiece> _clientOreByNetId = new Dictionary<int, OrePiece>();
+        private readonly Dictionary<OrePiece, int> _clientOreToNetId = new Dictionary<OrePiece, int>(); // reverse: OrePiece → netId
 
         // Client: true until the first FullSnapshot is received (ignore deltas/ores until then)
         private bool _clientWaitingForSnapshot;
@@ -94,8 +97,8 @@ namespace MineMogulMultiplayer.Core
 
         // ── Ore position sync (host tracks last-sent positions, sends updates for moved ores) ──
         private readonly Dictionary<int, Vector3> _lastSentOrePositions = new Dictionary<int, Vector3>(); // netId → pos
-        private const float OrePositionMoveThreshold = 0.05f; // send if moved more than 5cm
-        private const int OrePositionSyncInterval = 2; // every 2 ticks (~10 times/sec at 20 tps)
+        private const float OrePositionMoveThreshold = 0.10f; // send if moved more than 10cm
+        private const int OrePositionSyncInterval = 3; // every 3 ticks (~7 times/sec at 20 tps)
         private readonly List<OrePositionUpdate> _poolOrePositionUpdates = new List<OrePositionUpdate>();
 
         // ── BreakableCrate network ID tracking (host only) ──
@@ -130,7 +133,12 @@ namespace MineMogulMultiplayer.Core
         private readonly Dictionary<int, float> _remotelyHeldOres = new Dictionary<int, float>(); // netId → lastUpdateTime
         private readonly Dictionary<int, Vector3> _lastRemoteOreVelocity = new Dictionary<int, Vector3>(); // netId → last known velocity
         private readonly Dictionary<int, float> _remotelyHeldCrates = new Dictionary<int, float>(); // netId → lastUpdateTime
-        private const float RemoteHoldTimeout = 0.8f; // seconds before ore returns to physics
+        private const float RemoteHoldTimeout = 1.0f; // seconds before ore returns to physics
+        private readonly List<int> _poolStaleReleaseIds = new List<int>(); // pooled list for ReleaseStaleRemoteOres
+        // ── Cached magnet reflection (avoid per-tick reflection cost) ──
+        private System.Reflection.FieldInfo _cachedMagnetHeldBodiesField;
+        private bool _magnetFieldLookedUp;
+        private readonly HashSet<Rigidbody> _magnetHeldBodiesSet = new HashSet<Rigidbody>(); // reused per tick
 
         // ── Debug bot (local testing without a second player) ──
         private bool _debugBotActive;
@@ -1140,13 +1148,19 @@ namespace MineMogulMultiplayer.Core
         {
             DirtyTracker.KnownOreIds.Clear();
             _hostOreInstanceToNetId.Clear();
+            _hostNetIdToOre.Clear();
+            _oreRigidbodyCache.Clear();
             _nextOreNetId = 1;
             foreach (var ore in OrePiece.AllOrePieces)
             {
                 if (ore == null) continue;
                 int id = ore.GetInstanceID();
                 DirtyTracker.KnownOreIds.Add(id);
-                _hostOreInstanceToNetId[id] = _nextOreNetId++;
+                int netId = _nextOreNetId++;
+                _hostOreInstanceToNetId[id] = netId;
+                _hostNetIdToOre[netId] = ore;
+                var rb = ore.GetComponent<Rigidbody>();
+                if (rb != null) _oreRigidbodyCache[netId] = rb;
             }
             _log.LogInfo($"[Session] Initialized {DirtyTracker.KnownOreIds.Count} known ores with network IDs");
         }
@@ -1167,8 +1181,10 @@ namespace MineMogulMultiplayer.Core
                     // Assign a network ID for this new ore
                     int netId = _nextOreNetId++;
                     _hostOreInstanceToNetId[id] = netId;
-
+                    _hostNetIdToOre[netId] = ore;
                     var rb = ore.GetComponent<Rigidbody>();
+                    if (rb != null) _oreRigidbodyCache[netId] = rb;
+
                     DirtyTracker.SpawnedOrePieces.Add(new OrePieceState
                     {
                         NetworkId = netId,
@@ -1192,6 +1208,9 @@ namespace MineMogulMultiplayer.Core
                     {
                         DirtyTracker.RemovedOrePieceIds.Add(netId); // network ID, not instance ID
                         _hostOreInstanceToNetId.Remove(knownId);
+                        _hostNetIdToOre.Remove(netId);
+                        _oreRigidbodyCache.Remove(netId);
+                        _lastSentOrePositions.Remove(netId);
                     }
                 }
             }
@@ -1206,37 +1225,32 @@ namespace MineMogulMultiplayer.Core
         private void SendOrePositionUpdates()
         {
             _poolOrePositionUpdates.Clear();
+            float sqrThreshold = OrePositionMoveThreshold * OrePositionMoveThreshold;
 
-            foreach (var ore in OrePiece.AllOrePieces)
+            foreach (var kv in _hostNetIdToOre)
             {
+                var ore = kv.Value;
                 if (ore == null) continue;
-                int instanceId = ore.GetInstanceID();
-                if (!_hostOreInstanceToNetId.TryGetValue(instanceId, out int netId))
-                    continue;
+                int netId = kv.Key;
 
                 var pos = ore.transform.position;
                 if (_lastSentOrePositions.TryGetValue(netId, out var lastPos))
                 {
-                    if (Vector3.SqrMagnitude(pos - lastPos) < OrePositionMoveThreshold * OrePositionMoveThreshold)
+                    if (Vector3.SqrMagnitude(pos - lastPos) < sqrThreshold)
                         continue;
                 }
 
                 _lastSentOrePositions[netId] = pos;
-                var rb = ore.GetComponent<Rigidbody>();
+                // Use cached rigidbody to avoid per-ore GetComponent call
+                _oreRigidbodyCache.TryGetValue(netId, out var rb);
+                var vel = (rb != null && !rb.IsSleeping()) ? rb.linearVelocity : Vector3.zero;
                 _poolOrePositionUpdates.Add(new OrePositionUpdate
                 {
                     NetworkId = netId,
                     Position = new NetVector3(pos),
                     Rotation = new NetQuaternion(ore.transform.rotation),
-                    Velocity = rb != null ? new NetVector3(rb.linearVelocity) : default
+                    Velocity = new NetVector3(vel)
                 });
-            }
-
-            // Clean up entries for removed ores
-            if (_poolOrePositionUpdates.Count > 0 || _poolRemovedOreIds.Count > 0)
-            {
-                foreach (var removedNetId in _poolRemovedOreIds)
-                    _lastSentOrePositions.Remove(removedNetId);
             }
 
             if (_poolOrePositionUpdates.Count > 0)
@@ -1291,31 +1305,14 @@ namespace MineMogulMultiplayer.Core
         {
             if (updates == null || updates.Count == 0) return;
 
-            // Build reverse lookup: netId → OrePiece (only for net IDs we need)
-            var needed = new HashSet<int>();
-            foreach (var upd in updates) needed.Add(upd.NetworkId);
-
-            var netIdToOre = new Dictionary<int, OrePiece>();
-            foreach (var kv in _hostOreInstanceToNetId)
-            {
-                if (!needed.Contains(kv.Value)) continue;
-                foreach (var ore in OrePiece.AllOrePieces)
-                {
-                    if (ore != null && ore.GetInstanceID() == kv.Key)
-                    {
-                        netIdToOre[kv.Value] = ore;
-                        break;
-                    }
-                }
-            }
-
             foreach (var upd in updates)
             {
-                if (netIdToOre.TryGetValue(upd.NetworkId, out var ore) && ore != null)
+                // Direct O(1) lookup using reverse map instead of scanning AllOrePieces
+                if (_hostNetIdToOre.TryGetValue(upd.NetworkId, out var ore) && ore != null)
                 {
                     ore.transform.position = upd.Position.ToUnity();
                     ore.transform.rotation = upd.Rotation.ToUnity();
-                    var rb = ore.GetComponent<Rigidbody>();
+                    _oreRigidbodyCache.TryGetValue(upd.NetworkId, out var rb);
                     if (rb != null)
                     {
                         rb.isKinematic = true;
@@ -1336,43 +1333,35 @@ namespace MineMogulMultiplayer.Core
             // Release stale ores
             if (_remotelyHeldOres.Count > 0)
             {
-                var toRelease = new List<int>();
+                _poolStaleReleaseIds.Clear();
                 foreach (var kv in _remotelyHeldOres)
                 {
                     if (now - kv.Value > RemoteHoldTimeout)
-                        toRelease.Add(kv.Key);
+                        _poolStaleReleaseIds.Add(kv.Key);
                 }
-                foreach (var netId in toRelease)
+                foreach (var netId in _poolStaleReleaseIds)
                 {
                     _remotelyHeldOres.Remove(netId);
                     _oreTargetPositions.Remove(netId);
                     _oreTargetRotations.Remove(netId);
-                    OrePiece foundOre = null;
+                    Rigidbody rb = null;
                     if (MultiplayerState.IsHost)
                     {
-                        foreach (var kv in _hostOreInstanceToNetId)
-                        {
-                            if (kv.Value != netId) continue;
-                            foreach (var ore in OrePiece.AllOrePieces)
-                            {
-                                if (ore != null && ore.GetInstanceID() == kv.Key)
-                                { foundOre = ore; break; }
-                            }
-                            break;
-                        }
+                        // O(1) lookup via reverse map
+                        if (_hostNetIdToOre.TryGetValue(netId, out var hostOre) && hostOre != null)
+                            _oreRigidbodyCache.TryGetValue(netId, out rb);
                     }
-                    else if (_clientOreByNetId.TryGetValue(netId, out var clientOre))
+                    else if (_clientOreByNetId.TryGetValue(netId, out var clientOre) && clientOre != null)
                     {
-                        foundOre = clientOre;
+                        rb = clientOre.GetComponent<Rigidbody>();
                     }
-                    if (foundOre != null)
+                    if (rb != null)
                     {
-                        var rb = foundOre.GetComponent<Rigidbody>();
-                        if (rb != null)
+                        rb.isKinematic = false;
+                        if (_lastRemoteOreVelocity.TryGetValue(netId, out var vel))
                         {
-                            rb.isKinematic = false;
-                            if (_lastRemoteOreVelocity.TryGetValue(netId, out var vel))
-                                rb.linearVelocity = vel;
+                            // Dampen release velocity to reduce bouncing in piles
+                            rb.linearVelocity = vel * 0.5f;
                         }
                     }
                     _lastRemoteOreVelocity.Remove(netId);
@@ -1382,13 +1371,13 @@ namespace MineMogulMultiplayer.Core
             // Release stale crates
             if (_remotelyHeldCrates.Count > 0)
             {
-                var toRelease = new List<int>();
+                _poolStaleReleaseIds.Clear();
                 foreach (var kv in _remotelyHeldCrates)
                 {
                     if (now - kv.Value > RemoteHoldTimeout)
-                        toRelease.Add(kv.Key);
+                        _poolStaleReleaseIds.Add(kv.Key);
                 }
-                foreach (var netId in toRelease)
+                foreach (var netId in _poolStaleReleaseIds)
                 {
                     _remotelyHeldCrates.Remove(netId);
                     _crateTargetPositions.Remove(netId);
@@ -1408,8 +1397,8 @@ namespace MineMogulMultiplayer.Core
                             {
                                 if (crate != null && crate.GetInstanceID() == instanceId)
                                 {
-                                    var rb = crate.GetComponent<Rigidbody>();
-                                    if (rb != null) rb.isKinematic = false;
+                                    var rb2 = crate.GetComponent<Rigidbody>();
+                                    if (rb2 != null) rb2.isKinematic = false;
                                     break;
                                 }
                             }
@@ -1417,8 +1406,8 @@ namespace MineMogulMultiplayer.Core
                     }
                     else if (_clientCrateByNetId.TryGetValue(netId, out var clientCrate) && clientCrate != null)
                     {
-                        var rb = clientCrate.GetComponent<Rigidbody>();
-                        if (rb != null) rb.isKinematic = false;
+                        var rb2 = clientCrate.GetComponent<Rigidbody>();
+                        if (rb2 != null) rb2.isKinematic = false;
                     }
                 }
             }
@@ -1612,30 +1601,36 @@ namespace MineMogulMultiplayer.Core
             }
             catch { }
 
-            // Build a set of rigidbodies held by the local magnet for fast lookup
-            HashSet<Rigidbody> magnetHeldBodies = null;
+            // Build a set of rigidbodies held by the local magnet for fast lookup (cached field info + reused HashSet)
+            _magnetHeldBodiesSet.Clear();
             if (activeMagnet != null)
             {
                 try
                 {
-                    var heldField = typeof(ToolMagnet).GetField("_heldBodies",
-                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                    if (heldField != null)
+                    if (!_magnetFieldLookedUp)
                     {
-                        var held = heldField.GetValue(activeMagnet) as System.Collections.Generic.List<Rigidbody>;
-                        if (held != null && held.Count > 0)
-                            magnetHeldBodies = new HashSet<Rigidbody>(held);
+                        _cachedMagnetHeldBodiesField = typeof(ToolMagnet).GetField("_heldBodies",
+                            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                        _magnetFieldLookedUp = true;
+                    }
+                    if (_cachedMagnetHeldBodiesField != null)
+                    {
+                        var held = _cachedMagnetHeldBodiesField.GetValue(activeMagnet) as System.Collections.Generic.List<Rigidbody>;
+                        if (held != null)
+                        {
+                            for (int i = 0; i < held.Count; i++)
+                                if (held[i] != null) _magnetHeldBodiesSet.Add(held[i]);
+                        }
                     }
                 }
                 catch { }
             }
+            bool hasMagnetBodies = _magnetHeldBodiesSet.Count > 0;
 
             foreach (var kv in _clientOreByNetId)
             {
                 var ore = kv.Value;
                 if (ore == null) continue;
-
-                float sqrDist = Vector3.SqrMagnitude(ore.transform.position - playerPos);
 
                 // Primary check: OrePiece.CurrentMagnetTool is set when magnet grabs the ore
                 if (ore.CurrentMagnetTool != null)
@@ -1653,43 +1648,38 @@ namespace MineMogulMultiplayer.Core
                     continue;
                 }
 
+                // Skip expensive checks for far-away ores
+                float sqrDist = Vector3.SqrMagnitude(ore.transform.position - playerPos);
+                if (sqrDist >= 225f) continue; // 15m — nothing beyond this range is relevant
+
+                // Single GetComponent<Rigidbody> per ore for all checks below
+                var rb = ore.GetComponent<Rigidbody>();
+
                 // Secondary check: magnet _heldBodies contains this ore's rigidbody
-                if (magnetHeldBodies != null && sqrDist < 225f)
+                if (hasMagnetBodies && rb != null && _magnetHeldBodiesSet.Contains(rb))
                 {
-                    var oreRb = ore.GetComponent<Rigidbody>();
-                    if (oreRb != null && magnetHeldBodies.Contains(oreRb))
+                    if (rb.isKinematic)
                     {
-                        if (oreRb.isKinematic)
-                        {
-                            oreRb.isKinematic = false;
-                            _remotelyHeldOres.Remove(kv.Key);
-                            _oreTargetPositions.Remove(kv.Key);
-                            _oreTargetRotations.Remove(kv.Key);
-                        }
-                        TryAddClientOreUpdate(ore);
-                        continue;
+                        rb.isKinematic = false;
+                        _remotelyHeldOres.Remove(kv.Key);
+                        _oreTargetPositions.Remove(kv.Key);
+                        _oreTargetRotations.Remove(kv.Key);
                     }
+                    TryAddClientOreUpdate(ore);
+                    continue;
                 }
 
-                // Fallback: check for any joint on the ore itself
-                if (sqrDist < 225f) // 15m
+                // Fallback: check for any joint on the ore itself (magnet spring joint)
+                if (ore.GetComponent<Joint>() != null)
                 {
-                    var joint = ore.GetComponent<Joint>();
-                    if (joint != null)
-                    {
-                        TryAddClientOreUpdate(ore);
-                        continue;
-                    }
+                    TryAddClientOreUpdate(ore);
+                    continue;
                 }
 
                 // If magnet equipped, detect ores with velocity within range (being attracted)
-                if (hasMagnet && sqrDist < 100f) // 10m
+                if (hasMagnet && sqrDist < 100f && rb != null && !rb.isKinematic && rb.linearVelocity.sqrMagnitude > 0.25f)
                 {
-                    var rb = ore.GetComponent<Rigidbody>();
-                    if (rb != null && !rb.isKinematic && rb.linearVelocity.sqrMagnitude > 0.25f)
-                    {
-                        TryAddClientOreUpdate(ore);
-                    }
+                    TryAddClientOreUpdate(ore);
                 }
             }
 
@@ -1702,44 +1692,35 @@ namespace MineMogulMultiplayer.Core
                 var crate = kv.Value;
                 if (crate == null) continue;
                 float sqrDist = Vector3.SqrMagnitude(crate.transform.position - playerPos);
+                if (sqrDist >= 225f) continue; // 15m
+
+                var crateRb = crate.GetComponent<Rigidbody>();
 
                 // Check magnet _heldBodies for crate's rigidbody
-                if (magnetHeldBodies != null && sqrDist < 225f)
+                if (hasMagnetBodies && crateRb != null && _magnetHeldBodiesSet.Contains(crateRb))
                 {
-                    var crateRb = crate.GetComponent<Rigidbody>();
-                    if (crateRb != null && magnetHeldBodies.Contains(crateRb))
+                    if (crateRb.isKinematic)
                     {
-                        if (crateRb.isKinematic)
-                        {
-                            crateRb.isKinematic = false;
-                            _remotelyHeldCrates.Remove(kv.Key);
-                            _crateTargetPositions.Remove(kv.Key);
-                            _crateTargetRotations.Remove(kv.Key);
-                        }
-                        TryAddClientCrateUpdate(crate);
-                        continue;
+                        crateRb.isKinematic = false;
+                        _remotelyHeldCrates.Remove(kv.Key);
+                        _crateTargetPositions.Remove(kv.Key);
+                        _crateTargetRotations.Remove(kv.Key);
                     }
+                    TryAddClientCrateUpdate(crate);
+                    continue;
                 }
 
                 // Check for any joint component (magnet/physics grab)
-                if (sqrDist < 225f) // 15m
+                if (crate.GetComponent<Joint>() != null)
                 {
-                    var joint = crate.GetComponent<Joint>();
-                    if (joint != null)
-                    {
-                        TryAddClientCrateUpdate(crate);
-                        continue;
-                    }
+                    TryAddClientCrateUpdate(crate);
+                    continue;
                 }
 
                 // If magnet equipped, detect crates with velocity within range
-                if (hasMagnet && sqrDist < 100f) // 10m
+                if (hasMagnet && sqrDist < 100f && crateRb != null && !crateRb.isKinematic && crateRb.linearVelocity.sqrMagnitude > 0.25f)
                 {
-                    var rb = crate.GetComponent<Rigidbody>();
-                    if (rb != null && !rb.isKinematic && rb.linearVelocity.sqrMagnitude > 0.25f)
-                    {
-                        TryAddClientCrateUpdate(crate);
-                    }
+                    TryAddClientCrateUpdate(crate);
                 }
             }
 
@@ -1750,17 +1731,8 @@ namespace MineMogulMultiplayer.Core
 
         private void TryAddClientOreUpdate(OrePiece ore)
         {
-            // Find network ID for this ore
-            int netId = -1;
-            foreach (var kv in _clientOreByNetId)
-            {
-                if (kv.Value == ore)
-                {
-                    netId = kv.Key;
-                    break;
-                }
-            }
-            if (netId < 0) return;
+            // O(1) reverse lookup instead of scanning _clientOreByNetId
+            if (!_clientOreToNetId.TryGetValue(ore, out int netId)) return;
 
             // Mark this ore as locally held so host position updates are skipped
             _clientLocallyHeldOres.Add(netId);
@@ -3755,6 +3727,7 @@ namespace MineMogulMultiplayer.Core
                 foreach (var kv in _clientOreByNetId)
                     if (kv.Value != null) kv.Value.Delete();
                 _clientOreByNetId.Clear();
+                _clientOreToNetId.Clear();
                 _log.LogInfo($"[Session] Ore reconcile: removed all {removed} untracked + {_clientOreByNetId.Count} tracked (host has 0)");
                 return;
             }
@@ -3780,7 +3753,11 @@ namespace MineMogulMultiplayer.Core
                 }
             }
             foreach (var id in toRemove)
+            {
+                if (_clientOreByNetId.TryGetValue(id, out var removedOre))
+                    _clientOreToNetId.Remove(removedOre);
                 _clientOreByNetId.Remove(id);
+            }
 
             // Spawn ores the host has that we don't
             foreach (var ho in hostOres)
@@ -4031,6 +4008,7 @@ namespace MineMogulMultiplayer.Core
 
                 // Track by network ID for later removal
                 _clientOreByNetId[ore.NetworkId] = spawned;
+                _clientOreToNetId[spawned] = ore.NetworkId;
             }
         }
 
@@ -4038,7 +4016,11 @@ namespace MineMogulMultiplayer.Core
         {
             if (_clientOreByNetId.TryGetValue(networkId, out var ore))
             {
-                if (ore != null) ore.Delete();
+                if (ore != null)
+                {
+                    _clientOreToNetId.Remove(ore);
+                    ore.Delete();
+                }
                 _clientOreByNetId.Remove(networkId);
             }
             _oreTargetPositions.Remove(networkId);
@@ -5935,7 +5917,10 @@ namespace MineMogulMultiplayer.Core
             _cachedPlayerController = null;
             _loggedFirstDelta = false;
             _hostOreInstanceToNetId.Clear();
+            _hostNetIdToOre.Clear();
+            _oreRigidbodyCache.Clear();
             _clientOreByNetId.Clear();
+            _clientOreToNetId.Clear();
             _lastSentOrePositions.Clear();
             _clientLastSentOrePos.Clear();
             _clientLastSentCratePos.Clear();
