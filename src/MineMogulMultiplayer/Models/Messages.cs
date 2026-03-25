@@ -27,6 +27,7 @@ namespace MineMogulMultiplayer.Models
         MineNode         = 24,
         ResearchItem     = 25,
         CrateDamage      = 26,
+        ToolDrop         = 27,
 
         // Host → Client events
         BuildingSpawned  = 30,
@@ -43,6 +44,7 @@ namespace MineMogulMultiplayer.Models
         ShopPurchaseNotify = 41,
         ClientInventoryReport = 42,
         SoundEvent = 43,
+        ToolPickup       = 44,
 
         // Lobby flow
         LobbyLaunch      = 50,
@@ -130,6 +132,23 @@ namespace MineMogulMultiplayer.Models
     {
         [Key(0)] public int PlayerId;
         [Key(1)] public string ResearchItemId;
+    }
+
+    [MessagePackObject]
+    public class ToolDropMessage
+    {
+        [Key(0)] public int PlayerId;
+        [Key(1)] public string ToolName;
+        [Key(2)] public NetVector3 Position;
+        [Key(3)] public NetQuaternion Rotation;
+        [Key(4)] public NetVector3 Velocity;
+    }
+
+    [MessagePackObject]
+    public class ToolPickupMessage
+    {
+        [Key(0)] public int PlayerId;
+        [Key(1)] public string ToolName;
     }
 
     // ──────────────────────────────────────────────

@@ -394,7 +394,7 @@ namespace MineMogulMultiplayer.UI
 
             var refreshBtn = UIFactory.CreateButton(spRt, "RefreshSaves", "Refresh",
                 UIFactory.ButtonSecondary, 11, 24);
-            refreshBtn.onClick.AddListener(RefreshSaveList);
+            refreshBtn.onClick.AddListener(() => { _saveListDirty = true; RefreshSaveList(); });
 
             var (_, saveContent) = UIFactory.CreateScrollView(spRt, "SavesList", 130);
             _saveListContent = saveContent;
@@ -641,7 +641,7 @@ namespace MineMogulMultiplayer.UI
         {
             if (_session == null || !_session.SteamReady || _session.Phase != SessionManager.LobbyPhase.InLobby) return;
 
-            // Resolve scene name
+            // Resolve scene name from LevelManager, with fallback for flat/custom worlds
             string sceneName = null;
             var levelMgr = Singleton<LevelManager>.Instance;
             if (levelMgr != null)
@@ -649,6 +649,28 @@ namespace MineMogulMultiplayer.UI
                 var levelInfo = levelMgr.GetLevelByID(levelId);
                 if (levelInfo != null)
                     sceneName = levelInfo.SceneName;
+            }
+
+            // Fallback: try common scene name patterns
+            if (string.IsNullOrEmpty(sceneName))
+            {
+                string[] candidates = { $"Gameplay_{levelId}", levelId };
+                foreach (var candidate in candidates)
+                {
+                    // Verify the scene exists in build settings
+                    for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCountInBuildSettings; i++)
+                    {
+                        var path = UnityEngine.SceneManagement.SceneUtility.GetScenePathByBuildIndex(i);
+                        var name = System.IO.Path.GetFileNameWithoutExtension(path);
+                        if (string.Equals(name, candidate, System.StringComparison.OrdinalIgnoreCase))
+                        {
+                            sceneName = candidate;
+                            _log?.LogInfo($"[UI] Resolved '{levelId}' to scene '{sceneName}' via fallback");
+                            break;
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(sceneName)) break;
+                }
             }
 
             if (string.IsNullOrEmpty(sceneName))
@@ -810,6 +832,11 @@ namespace MineMogulMultiplayer.UI
             try
             {
                 var saves = SavingLoadingManager.GetAllSaveFileHeaderFileCombos();
+
+                _log?.LogInfo($"[UI] RefreshSaveList found {saves?.Count ?? 0} save(s)");
+                if (saves != null)
+                    foreach (var c in saves)
+                        _log?.LogInfo($"[UI]   Save: '{c.SaveFileHeader?.SaveFileName}' Level='{c.SaveFileHeader?.LevelID}' Path='{c.FullFilePath}'");
 
                 if (saves == null || saves.Count == 0)
                 {

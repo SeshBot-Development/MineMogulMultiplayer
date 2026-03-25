@@ -749,6 +749,35 @@ namespace MineMogulMultiplayer.Core
             }
         }
 
+        /// <summary>Launch a new game in multiplayer mode. Creates the save file on first auto-save.</summary>
+        public void LaunchNewGame(string saveName, string sceneName, string playerName)
+        {
+            if (!SteamReady || !_lobby.HasValue) { _log.LogError("[Session] Cannot launch — no lobby"); return; }
+
+            _pendingPlayerName = playerName;
+            Phase = LobbyPhase.Launching;
+
+            _lobby.Value.SetData("state", "launching");
+            _lobby.Value.SetData("scene_name", sceneName);
+
+            _pendingHost = true;
+            _hostSaveFilePath = null; // New game — no save file yet
+
+            var slm = Singleton<SavingLoadingManager>.Instance;
+            if (slm != null)
+            {
+                slm.LoadSceneAndStartNewSaveFile(saveName, sceneName);
+                _log.LogInfo($"[Session] Host launching new game: save='{saveName}' scene='{sceneName}'");
+            }
+            else
+            {
+                _log.LogError("[Session] SavingLoadingManager not available");
+                Phase = LobbyPhase.InLobby;
+                _pendingHost = false;
+                _net.Stop(); _net = null;
+            }
+        }
+
         /// <summary>Called on client when lobby data says "launching".</summary>
         private void HandleLobbyLaunch()
         {
@@ -1090,6 +1119,13 @@ namespace MineMogulMultiplayer.Core
             }
 
             // Inventory sync disabled — each player has their own independent inventory
+
+            // Broadcast inventory if a tool was dropped/picked up
+            if (_pendingInventoryBroadcast)
+            {
+                _pendingInventoryBroadcast = false;
+                BroadcastInventorySync();
+            }
 
             if (_tick % HashCheckInterval == 0)
             {
@@ -1554,17 +1590,42 @@ namespace MineMogulMultiplayer.Core
             }
             catch { /* HeldObject may not exist in this game version */ }
 
-            // Check for magnet-held ores: scan nearby ores for any joint or velocity
+            // Check for magnet-held ores: use OrePiece.CurrentMagnetTool and scan ToolMagnet._heldBodies
             var playerPos = pc.transform.position;
             bool hasMagnet = false;
+            ToolMagnet activeMagnet = null;
             try
             {
                 var toolName = _lastValidToolName;
                 if (string.IsNullOrEmpty(toolName)) toolName = GetEquippedToolName(pc);
                 hasMagnet = !string.IsNullOrEmpty(toolName) &&
                             toolName.IndexOf("Magnet", System.StringComparison.OrdinalIgnoreCase) >= 0;
+                if (hasMagnet)
+                {
+                    var inv = pc.GetComponent<PlayerInventory>();
+                    if (inv != null && inv.ActiveTool != null)
+                        activeMagnet = inv.ActiveTool.GetComponent<ToolMagnet>();
+                }
             }
             catch { }
+
+            // Build a set of rigidbodies held by the local magnet for fast lookup
+            HashSet<Rigidbody> magnetHeldBodies = null;
+            if (activeMagnet != null)
+            {
+                try
+                {
+                    var heldField = typeof(ToolMagnet).GetField("_heldBodies",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    if (heldField != null)
+                    {
+                        var held = heldField.GetValue(activeMagnet) as System.Collections.Generic.List<Rigidbody>;
+                        if (held != null && held.Count > 0)
+                            magnetHeldBodies = new HashSet<Rigidbody>(held);
+                    }
+                }
+                catch { }
+            }
 
             foreach (var kv in _clientOreByNetId)
             {
@@ -1573,7 +1634,41 @@ namespace MineMogulMultiplayer.Core
 
                 float sqrDist = Vector3.SqrMagnitude(ore.transform.position - playerPos);
 
-                // Check for any joint component (SpringJoint, FixedJoint, ConfigurableJoint, etc.)
+                // Primary check: OrePiece.CurrentMagnetTool is set when magnet grabs the ore
+                if (ore.CurrentMagnetTool != null)
+                {
+                    // Force non-kinematic so the magnet spring can actually move the ore
+                    var oreRb = ore.GetComponent<Rigidbody>();
+                    if (oreRb != null && oreRb.isKinematic)
+                    {
+                        oreRb.isKinematic = false;
+                        _remotelyHeldOres.Remove(kv.Key);
+                        _oreTargetPositions.Remove(kv.Key);
+                        _oreTargetRotations.Remove(kv.Key);
+                    }
+                    TryAddClientOreUpdate(ore);
+                    continue;
+                }
+
+                // Secondary check: magnet _heldBodies contains this ore's rigidbody
+                if (magnetHeldBodies != null && sqrDist < 225f)
+                {
+                    var oreRb = ore.GetComponent<Rigidbody>();
+                    if (oreRb != null && magnetHeldBodies.Contains(oreRb))
+                    {
+                        if (oreRb.isKinematic)
+                        {
+                            oreRb.isKinematic = false;
+                            _remotelyHeldOres.Remove(kv.Key);
+                            _oreTargetPositions.Remove(kv.Key);
+                            _oreTargetRotations.Remove(kv.Key);
+                        }
+                        TryAddClientOreUpdate(ore);
+                        continue;
+                    }
+                }
+
+                // Fallback: check for any joint on the ore itself
                 if (sqrDist < 225f) // 15m
                 {
                     var joint = ore.GetComponent<Joint>();
@@ -1604,6 +1699,24 @@ namespace MineMogulMultiplayer.Core
                 var crate = kv.Value;
                 if (crate == null) continue;
                 float sqrDist = Vector3.SqrMagnitude(crate.transform.position - playerPos);
+
+                // Check magnet _heldBodies for crate's rigidbody
+                if (magnetHeldBodies != null && sqrDist < 225f)
+                {
+                    var crateRb = crate.GetComponent<Rigidbody>();
+                    if (crateRb != null && magnetHeldBodies.Contains(crateRb))
+                    {
+                        if (crateRb.isKinematic)
+                        {
+                            crateRb.isKinematic = false;
+                            _remotelyHeldCrates.Remove(kv.Key);
+                            _crateTargetPositions.Remove(kv.Key);
+                            _crateTargetRotations.Remove(kv.Key);
+                        }
+                        TryAddClientCrateUpdate(crate);
+                        continue;
+                    }
+                }
 
                 // Check for any joint component (magnet/physics grab)
                 if (sqrDist < 225f) // 15m
@@ -2485,6 +2598,14 @@ namespace MineMogulMultiplayer.Core
                         var hostSoundMsg = NetSerializer.Deserialize<SoundEventMessage>(payload);
                         HandleSoundEventFromClient(clientId, hostSoundMsg);
                         break;
+                    case MessageType.ToolDrop:
+                        var toolDrop = NetSerializer.Deserialize<ToolDropMessage>(payload);
+                        HandleToolDrop(clientId, toolDrop);
+                        break;
+                    case MessageType.ToolPickup:
+                        var toolPickup = NetSerializer.Deserialize<ToolPickupMessage>(payload);
+                        HandleToolPickup(clientId, toolPickup);
+                        break;
                 }
             }
             catch (Exception ex)
@@ -2599,6 +2720,16 @@ namespace MineMogulMultiplayer.Core
                         if (_clientWaitingForSnapshot) break;
                         var clientDropMsg = NetSerializer.Deserialize<ItemDroppedMessage>(payload);
                         ApplyItemDropped(clientDropMsg);
+                        break;
+                    case MessageType.ToolDrop:
+                        if (_clientWaitingForSnapshot) break;
+                        var remoteToolDrop = NetSerializer.Deserialize<ToolDropMessage>(payload);
+                        ApplyRemoteToolDrop(remoteToolDrop);
+                        break;
+                    case MessageType.ToolPickup:
+                        if (_clientWaitingForSnapshot) break;
+                        var remoteToolPickup = NetSerializer.Deserialize<ToolPickupMessage>(payload);
+                        ApplyRemoteToolPickup(remoteToolPickup);
                         break;
                     case MessageType.SoundEvent:
                         var clientSoundMsg = NetSerializer.Deserialize<SoundEventMessage>(payload);
@@ -4012,6 +4143,37 @@ namespace MineMogulMultiplayer.Core
                     }
                 }
             }
+
+            // Remove excess tools (host dropped or removed a tool we still have)
+            Patches.ToolPatch.NetworkBypass = true;
+            try
+            {
+                foreach (var kv in localToolCounts)
+                {
+                    hostToolCounts.TryGetValue(kv.Key, out int hostCount);
+                    int toRemove = kv.Value - hostCount;
+                    if (toRemove <= 0) continue;
+                    if (kv.Key == "ToolBuilder") continue;
+
+                    if (!System.Enum.TryParse<SavableObjectID>(kv.Key, out var sid)) continue;
+
+                    int removed = 0;
+                    for (int i = inv.Items.Count - 1; i >= 0 && removed < toRemove; i--)
+                    {
+                        var tool = inv.Items[i];
+                        if (tool != null && tool.SavableObjectID == sid)
+                        {
+                            var bht = tool.GetComponent<BaseHeldTool>();
+                            if (bht != null)
+                                inv.RemoveFromInventory(bht);
+                            UnityEngine.Object.Destroy(tool.gameObject);
+                            removed++;
+                            _log.LogInfo($"[Session] Removed excess tool '{kv.Key}' from inventory (shared sync)");
+                        }
+                    }
+                }
+            }
+            finally { Patches.ToolPatch.NetworkBypass = false; }
         }
 
         /// <summary>Host: store the client's inventory report for save persistence.</summary>
@@ -4597,6 +4759,37 @@ namespace MineMogulMultiplayer.Core
             _log.LogInfo($"[Session] Sent shop purchase notification: {purchasedTools.Length} tools, cost={totalCost}");
         }
 
+        /// <summary>Client: tell host a tool was dropped, including position/physics data.</summary>
+        public void SendToolDropRPC(string toolName, Vector3 pos, Quaternion rot, Vector3 vel)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.ToolDrop, new ToolDropMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                ToolName = toolName,
+                Position = new NetVector3(pos),
+                Rotation = new NetQuaternion(rot),
+                Velocity = new NetVector3(vel)
+            });
+            _log.LogInfo($"[Session] Sent tool drop RPC: {toolName} at ({pos.x:F1},{pos.y:F1},{pos.z:F1})");
+        }
+
+        /// <summary>Client: tell host to add a tool to the shared inventory (tool was picked up).</summary>
+        public void SendToolPickupRPC(string toolName)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.ToolPickup, new ToolPickupMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                ToolName = toolName
+            });
+            _log.LogInfo($"[Session] Sent tool pickup RPC: {toolName}");
+        }
+
+        private bool _pendingInventoryBroadcast;
+        /// <summary>Schedule an inventory broadcast on the next tick (used after host tool changes).</summary>
+        public void ScheduleInventoryBroadcast() { _pendingInventoryBroadcast = true; }
+
         /// <summary>Host: handle a client purchase notification — deduct shared money only (inventories are independent).</summary>
         private void HandleShopPurchaseNotify(uint clientId, ShopPurchaseNotifyMessage msg)
         {
@@ -4611,6 +4804,187 @@ namespace MineMogulMultiplayer.Core
                 finally { EconomyPatch.NetworkBypass = false; }
                 DirtyTracker.MoneyDirty = true;
             }
+        }
+
+        /// <summary>Host: a client dropped a tool — drop from host inventory at client's position, broadcast to all.</summary>
+        private void HandleToolDrop(uint clientId, ToolDropMessage msg)
+        {
+            _log.LogInfo($"[Session] Client {clientId} dropped tool '{msg.ToolName}'");
+
+            // Remove from host inventory and destroy (we'll spawn a fresh world copy)
+            RemoveToolFromHostInventory(msg.ToolName);
+
+            // Spawn a world-visible copy at the client's drop position
+            SpawnWorldTool(msg.ToolName, msg.Position.ToUnity(), msg.Rotation.ToUnity(), msg.Velocity.ToUnity());
+
+            // Broadcast to ALL clients so they see the world object
+            // (the dropping client ignores their own PlayerId)
+            _net.SendToAll(MessageType.ToolDrop, msg);
+
+            BroadcastInventorySync();
+        }
+
+        /// <summary>Host: a client picked up a tool from the ground — add to host inventory, clean up world copies.</summary>
+        private void HandleToolPickup(uint clientId, ToolPickupMessage msg)
+        {
+            _log.LogInfo($"[Session] Client {clientId} picked up tool '{msg.ToolName}'");
+
+            // Destroy the world copy on the host side
+            DestroyDroppedWorldTool(msg.ToolName);
+
+            AddToolToHostInventory(msg.ToolName);
+
+            // Broadcast to all clients so they destroy their world copies
+            _net.SendToAll(MessageType.ToolPickup, msg);
+
+            BroadcastInventorySync();
+        }
+
+        /// <summary>Host → all clients: a tool was dropped — spawn a world object.</summary>
+        public void BroadcastToolWorldDrop(string toolName, Vector3 pos, Quaternion rot, Vector3 vel)
+        {
+            if (!MultiplayerState.IsHost || _net == null) return;
+            _net.SendToAll(MessageType.ToolDrop, new ToolDropMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                ToolName = toolName,
+                Position = new NetVector3(pos),
+                Rotation = new NetQuaternion(rot),
+                Velocity = new NetVector3(vel)
+            });
+        }
+
+        /// <summary>Host → all clients: a tool was picked up — destroy world copies.</summary>
+        public void BroadcastToolWorldPickup(string toolName)
+        {
+            if (!MultiplayerState.IsHost || _net == null) return;
+            _net.SendToAll(MessageType.ToolPickup, new ToolPickupMessage
+            {
+                PlayerId = MultiplayerState.LocalPlayerId,
+                ToolName = toolName
+            });
+        }
+
+        /// <summary>Client: apply a remote tool drop — spawn a world-visible copy.</summary>
+        private void ApplyRemoteToolDrop(ToolDropMessage msg)
+        {
+            // Don't double-spawn for our own drops (already visible locally)
+            if (msg.PlayerId == MultiplayerState.LocalPlayerId) return;
+
+            _log.LogInfo($"[Session] Remote tool drop: '{msg.ToolName}' at {msg.Position}");
+            SpawnWorldTool(msg.ToolName, msg.Position.ToUnity(), msg.Rotation.ToUnity(), msg.Velocity.ToUnity());
+        }
+
+        /// <summary>Client: apply a remote tool pickup — destroy the matching world copy.</summary>
+        private void ApplyRemoteToolPickup(ToolPickupMessage msg)
+        {
+            if (msg.PlayerId == MultiplayerState.LocalPlayerId) return;
+
+            _log.LogInfo($"[Session] Remote tool pickup: '{msg.ToolName}'");
+            DestroyDroppedWorldTool(msg.ToolName);
+        }
+
+        /// <summary>Instantiate a tool prefab as a world object with physics (visible on ground).</summary>
+        private void SpawnWorldTool(string toolName, Vector3 pos, Quaternion rot, Vector3 vel)
+        {
+            if (!System.Enum.TryParse<SavableObjectID>(toolName, out var sid)) return;
+            var slm = Singleton<SavingLoadingManager>.Instance;
+            if (slm == null) return;
+
+            var prefab = slm.GetPrefab(sid);
+            if (prefab == null) { _log.LogWarning($"[Session] No prefab for '{toolName}'"); return; }
+
+            var go = UnityEngine.Object.Instantiate(prefab, pos, rot);
+            go.SetActive(true);
+
+            // Show world model, hide view model
+            var bht = go.GetComponent<BaseHeldTool>();
+            if (bht != null)
+            {
+                bht.HideWorldModel(false);
+                bht.HideViewModel(true);
+                bht.Owner = null;
+            }
+
+            // Enable physics
+            var rb = go.GetComponentInChildren<Rigidbody>();
+            if (rb != null)
+            {
+                go.transform.parent = null;
+                rb.isKinematic = false;
+                rb.position = pos;
+                rb.rotation = rot;
+                rb.linearVelocity = vel;
+            }
+
+            _log.LogInfo($"[Session] Spawned world tool '{toolName}' at ({pos.x:F1},{pos.y:F1},{pos.z:F1})");
+        }
+
+        /// <summary>Find and destroy a loose (dropped) tool in the scene with a matching ID.</summary>
+        private void DestroyDroppedWorldTool(string toolName)
+        {
+            if (!System.Enum.TryParse<SavableObjectID>(toolName, out var sid)) return;
+
+            foreach (var bht in UnityEngine.Object.FindObjectsByType<BaseHeldTool>(FindObjectsSortMode.None))
+            {
+                if (bht == null) continue;
+                if (bht.SavableObjectID != sid) continue;
+                if (bht.Owner != null) continue; // Still held/in inventory — skip
+                UnityEngine.Object.Destroy(bht.gameObject);
+                _log.LogInfo($"[Session] Destroyed dropped world tool '{toolName}'");
+                return;
+            }
+        }
+
+        private void RemoveToolFromHostInventory(string toolName)
+        {
+            if (_cachedPlayerController == null)
+                _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
+            if (_cachedPlayerController == null) return;
+            var inv = _cachedPlayerController.GetComponent<PlayerInventory>();
+            if (inv == null) return;
+
+            if (!System.Enum.TryParse<SavableObjectID>(toolName, out var sid)) return;
+
+            // Find the first matching tool and silently remove it (no physics drop)
+            for (int i = 0; i < inv.Items.Count; i++)
+            {
+                var tool = inv.Items[i];
+                if (tool != null && tool.SavableObjectID == sid)
+                {
+                    var bht = tool.GetComponent<BaseHeldTool>();
+                    if (bht != null)
+                        inv.RemoveFromInventory(bht);
+                    UnityEngine.Object.Destroy(tool.gameObject);
+                    _log.LogInfo($"[Session] Removed '{toolName}' from host inventory at slot {i}");
+                    return;
+                }
+            }
+            _log.LogWarning($"[Session] Tool '{toolName}' not found in host inventory to remove");
+        }
+
+        private void AddToolToHostInventory(string toolName)
+        {
+            if (_cachedPlayerController == null)
+                _cachedPlayerController = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
+            if (_cachedPlayerController == null) return;
+            var inv = _cachedPlayerController.GetComponent<PlayerInventory>();
+            if (inv == null) return;
+            var slm = Singleton<SavingLoadingManager>.Instance;
+            if (slm == null) return;
+
+            if (!System.Enum.TryParse<SavableObjectID>(toolName, out var sid)) return;
+
+            var prefabGo = slm.GetPrefab(sid);
+            if (prefabGo == null) return;
+            var toolPrefab = prefabGo.GetComponent<BaseHeldTool>();
+            if (toolPrefab == null) return;
+
+            var spawned = UnityEngine.Object.Instantiate(toolPrefab);
+            Patches.ToolPatch.NetworkBypass = true;
+            try { spawned.TryAddToInventory(); }
+            finally { Patches.ToolPatch.NetworkBypass = false; }
+            _log.LogInfo($"[Session] Added '{toolName}' to host inventory");
         }
 
         /// <summary>Host broadcasts a newly placed building to all clients.</summary>
