@@ -178,6 +178,21 @@ namespace MineMogulMultiplayer.Networking
             _log?.LogInfo("Steam P2P stopped");
         }
 
+        /// <summary>Force-disconnect a specific client by closing their connection (host only).</summary>
+        public void DisconnectClient(uint clientId)
+        {
+            if (!_isHost || !_clients.TryGetValue(clientId, out var conn)) return;
+            try
+            {
+                conn.Close();
+                _log?.LogInfo($"[SteamP2P] Force-disconnected client {clientId}");
+            }
+            catch (Exception ex)
+            {
+                _log?.LogError($"[SteamP2P] Error disconnecting client {clientId}: {ex.Message}");
+            }
+        }
+
         // ── Send (host → specific client) ──
 
         public void SendToClient<T>(uint clientId, MessageType type, T payload)

@@ -49,6 +49,7 @@ namespace MineMogulMultiplayer.Models
 
         // Lobby flow
         LobbyLaunch      = 50,
+        KickPlayer       = 51,
     }
 
     [MessagePackObject]
@@ -198,6 +199,12 @@ namespace MineMogulMultiplayer.Models
     {
         [Key(0)] public string SceneName;
         [Key(1)] public string SaveFileName;
+    }
+
+    [MessagePackObject]
+    public class KickMessage
+    {
+        [Key(0)] public string Reason;
     }
 
     // ──────────────────────────────────────────────

@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using HarmonyLib;
 using MineMogulMultiplayer.Core;
+using MineMogulMultiplayer.UI;
 using Steamworks;
 using TMPro;
 using UnityEngine;
@@ -131,6 +132,8 @@ namespace MineMogulMultiplayer.Patches
             string goName = $"MP_Toggle_{menuId}";
             if (parent.Find(goName) != null) return; // already injected
 
+            UIFactory.HarvestGameAssets();
+
             // Container row
             var row = new GameObject(goName, typeof(RectTransform));
             row.transform.SetParent(parent, false);
@@ -139,14 +142,20 @@ namespace MineMogulMultiplayer.Patches
             rt.anchorMax = new Vector2(1f, 0f);
             rt.pivot = new Vector2(0.5f, 0f);
             rt.anchoredPosition = new Vector2(0, 8);
-            rt.sizeDelta = new Vector2(-20, 32);
+            rt.sizeDelta = new Vector2(-20, 36);
 
             var bg = row.AddComponent<Image>();
-            bg.color = new Color(0.12f, 0.12f, 0.17f, 0.92f);
+            bg.color = UIFactory.PanelBgLight;
+            UIFactory.ApplyRounded(bg);
+
+            // Subtle gold border
+            var outline = row.AddComponent<Outline>();
+            outline.effectColor = UIFactory.AccentGoldDim * new Color(1, 1, 1, 0.3f);
+            outline.effectDistance = new Vector2(1, -1);
 
             var hlg = row.AddComponent<HorizontalLayoutGroup>();
-            hlg.padding = new RectOffset(10, 10, 3, 3);
-            hlg.spacing = 8;
+            hlg.padding = new RectOffset(12, 12, 4, 4);
+            hlg.spacing = 10;
             hlg.childAlignment = TextAnchor.MiddleLeft;
             hlg.childForceExpandWidth = false;
             hlg.childForceExpandHeight = false;
@@ -155,45 +164,37 @@ namespace MineMogulMultiplayer.Patches
             var checkBgGo = new GameObject("ChkBg", typeof(RectTransform));
             checkBgGo.transform.SetParent(row.transform, false);
             var chkBgImg = checkBgGo.AddComponent<Image>();
-            chkBgImg.color = new Color(0.22f, 0.22f, 0.28f, 1f);
+            chkBgImg.color = UIFactory.RowBg;
+            UIFactory.ApplyRounded(chkBgImg);
             var chkBgLe = checkBgGo.AddComponent<LayoutElement>();
-            chkBgLe.preferredWidth = 20; chkBgLe.preferredHeight = 20;
+            chkBgLe.preferredWidth = 22; chkBgLe.preferredHeight = 22;
 
             // Checkmark
             var chkGo = new GameObject("Chk", typeof(RectTransform));
             chkGo.transform.SetParent(checkBgGo.transform, false);
             var chkImg = chkGo.AddComponent<Image>();
-            chkImg.color = new Color(0.35f, 0.82f, 0.35f, 1f);
+            chkImg.color = UIFactory.StatusGreen;
             var chkRt = chkGo.GetComponent<RectTransform>();
-            chkRt.anchorMin = new Vector2(0.15f, 0.15f);
-            chkRt.anchorMax = new Vector2(0.85f, 0.85f);
+            chkRt.anchorMin = new Vector2(0.18f, 0.18f);
+            chkRt.anchorMax = new Vector2(0.82f, 0.82f);
             chkRt.offsetMin = chkRt.offsetMax = Vector2.zero;
 
-            // Toggle component (on the checkbox bg)
+            // Toggle component
             var toggle = checkBgGo.AddComponent<Toggle>();
             toggle.graphic = chkImg;
             toggle.targetGraphic = chkBgImg;
             toggle.isOn = _multiplayerToggled;
 
             // Label
-            var labelGo = new GameObject("Lbl", typeof(RectTransform));
-            labelGo.transform.SetParent(row.transform, false);
-            var label = labelGo.AddComponent<TextMeshProUGUI>();
-            label.text = "HOST MULTIPLAYER";
-            label.fontSize = 13;
+            var label = UIFactory.CreateText(row.transform, "Lbl", "HOST MULTIPLAYER", 14, TextAlignmentOptions.MidlineLeft);
             label.fontStyle = FontStyles.Bold;
-            label.color = _multiplayerToggled
-                ? new Color(0.35f, 0.82f, 0.35f, 1f)
-                : new Color(0.85f, 0.8f, 0.45f, 1f);
-            label.alignment = TextAlignmentOptions.MidlineLeft;
-            labelGo.AddComponent<LayoutElement>().flexibleWidth = 1;
+            label.color = _multiplayerToggled ? UIFactory.StatusGreen : UIFactory.AccentGold;
+            label.gameObject.AddComponent<LayoutElement>().flexibleWidth = 1;
 
             toggle.onValueChanged.AddListener((bool on) =>
             {
                 _multiplayerToggled = on;
-                label.color = on
-                    ? new Color(0.35f, 0.82f, 0.35f, 1f)
-                    : new Color(0.85f, 0.8f, 0.45f, 1f);
+                label.color = on ? UIFactory.StatusGreen : UIFactory.AccentGold;
             });
         }
 
@@ -231,6 +232,8 @@ namespace MineMogulMultiplayer.Patches
         {
             if (_overlayRoot != null) { _overlayRoot.SetActive(true); RefreshPlayerList(); return; }
 
+            UIFactory.HarvestGameAssets();
+
             // Canvas
             _overlayRoot = new GameObject("MP_MenuLobbyOverlay");
             UnityEngine.Object.DontDestroyOnLoad(_overlayRoot);
@@ -240,71 +243,123 @@ namespace MineMogulMultiplayer.Patches
             var scaler = _overlayRoot.AddComponent<CanvasScaler>();
             scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
             scaler.referenceResolution = new Vector2(1920, 1080);
+            scaler.matchWidthOrHeight = 0.5f;
             _overlayRoot.AddComponent<GraphicRaycaster>();
 
             // Dim background
-            MakeStretchedImage(_overlayRoot.transform, "DimBG", new Color(0, 0, 0, 0.65f));
+            var dimBg = new GameObject("DimBG", typeof(RectTransform));
+            dimBg.transform.SetParent(_overlayRoot.transform, false);
+            var dimImg = dimBg.AddComponent<Image>();
+            dimImg.color = new Color(0, 0, 0, 0.70f);
+            var dimRt = dimBg.GetComponent<RectTransform>();
+            dimRt.anchorMin = Vector2.zero; dimRt.anchorMax = Vector2.one;
+            dimRt.offsetMin = dimRt.offsetMax = Vector2.zero;
 
-            // Center panel
+            // Center panel — matches MultiplayerPanel style
             var panel = new GameObject("Panel", typeof(RectTransform));
             panel.transform.SetParent(_overlayRoot.transform, false);
-            panel.AddComponent<Image>().color = new Color(0.10f, 0.10f, 0.14f, 0.97f);
+            var panelImg = panel.AddComponent<Image>();
+            panelImg.color = UIFactory.PanelBg;
+            UIFactory.ApplyRounded(panelImg);
             var pRt = panel.GetComponent<RectTransform>();
-            pRt.anchorMin = new Vector2(0.3f, 0.2f);
-            pRt.anchorMax = new Vector2(0.7f, 0.8f);
-            pRt.offsetMin = pRt.offsetMax = Vector2.zero;
+            pRt.anchorMin = new Vector2(0.5f, 0.5f);
+            pRt.anchorMax = new Vector2(0.5f, 0.5f);
+            pRt.pivot = new Vector2(0.5f, 0.5f);
+            pRt.sizeDelta = new Vector2(440, 480);
+
+            // Gold outline and glow
+            var glow = panel.AddComponent<Shadow>();
+            glow.effectColor = new Color(UIFactory.AccentGold.r, UIFactory.AccentGold.g, UIFactory.AccentGold.b, 0.18f);
+            glow.effectDistance = new Vector2(0, -4f);
+            var panelOutline = panel.AddComponent<Outline>();
+            panelOutline.effectColor = UIFactory.AccentGoldDim * new Color(1, 1, 1, 0.35f);
+            panelOutline.effectDistance = new Vector2(1, -1);
 
             var vlg = panel.AddComponent<VerticalLayoutGroup>();
-            vlg.padding = new RectOffset(20, 20, 16, 16);
-            vlg.spacing = 10;
+            vlg.padding = new RectOffset(0, 0, 0, 0);
+            vlg.spacing = 0;
             vlg.childForceExpandHeight = false;
             vlg.childForceExpandWidth = true;
+            vlg.childControlWidth = true;
+            vlg.childControlHeight = true;
 
-            // Title
-            AddText(pRt, "MULTIPLAYER LOBBY", 22, FontStyles.Bold, new Color(0.85f, 0.8f, 0.45f))
-                .gameObject.AddComponent<LayoutElement>().preferredHeight = 30;
+            // ── Header bar ──
+            var header = UIFactory.CreatePanel(pRt, "Header", UIFactory.HeaderBg, false);
+            var headerLe = header.gameObject.AddComponent<LayoutElement>();
+            headerLe.preferredHeight = 28; headerLe.minHeight = 28;
+            var hhlg = UIFactory.AddHorizontalLayout(header, 0);
+            hhlg.padding = new RectOffset(14, 14, 0, 0);
+            hhlg.childAlignment = TextAnchor.MiddleLeft;
 
-            // Status
-            _statusText = AddText(pRt, "Creating lobby...", 13, FontStyles.Normal, new Color(0.7f, 0.7f, 0.7f));
-            _statusText.gameObject.AddComponent<LayoutElement>().preferredHeight = 22;
+            var title = UIFactory.CreateText(header, "Title", "MULTIPLAYER LOBBY", 12, TextAlignmentOptions.MidlineLeft);
+            title.fontStyle = FontStyles.Bold;
+            title.color = UIFactory.AccentGold;
+            title.characterSpacing = 2;
+            title.gameObject.AddComponent<LayoutElement>().flexibleWidth = 1;
+
+            var verText = UIFactory.CreateText(header, "Ver", $"v{PluginInfo.Version}", 9, TextAlignmentOptions.MidlineRight);
+            verText.color = UIFactory.TextDim;
+            verText.gameObject.AddComponent<LayoutElement>().preferredWidth = 40;
+
+            // Gold accent line
+            UIFactory.AddDivider(pRt, 2);
+
+            // ── Status strip ──
+            var statusBar = UIFactory.CreatePanel(pRt, "StatusBar", UIFactory.PanelBgLight, false);
+            statusBar.gameObject.AddComponent<LayoutElement>().preferredHeight = 24;
+            _statusText = UIFactory.CreateText(statusBar, "Status", "Creating lobby...", 11, TextAlignmentOptions.Center);
+            _statusText.color = UIFactory.TextDim;
+            var stRt = _statusText.GetComponent<RectTransform>();
+            stRt.anchorMin = Vector2.zero; stRt.anchorMax = Vector2.one;
+            stRt.offsetMin = new Vector2(10, 0); stRt.offsetMax = new Vector2(-10, 0);
+
+            // ── Content area (padded) ──
+            var content = UIFactory.CreatePanel(pRt, "Content", Color.clear);
+            content.gameObject.AddComponent<LayoutElement>().flexibleHeight = 1;
+            var cVlg = UIFactory.AddVerticalLayout(content, 16, 16, 12, 12, 8);
+
+            // Players section
+            var playersLabel = UIFactory.CreateText(content, "PlayersLabel", "PLAYERS", 12);
+            playersLabel.fontStyle = FontStyles.Bold;
+            playersLabel.color = UIFactory.TextColor;
 
             // Player list scroll area
-            var scrollGo = new GameObject("Scroll", typeof(RectTransform));
-            scrollGo.transform.SetParent(pRt, false);
-            scrollGo.AddComponent<Image>().color = new Color(0.07f, 0.07f, 0.10f, 1f);
-            scrollGo.AddComponent<LayoutElement>().flexibleHeight = 1;
-            var scroll = scrollGo.AddComponent<ScrollRect>();
-            scroll.vertical = true; scroll.horizontal = false;
+            var (scroll, playerContent) = UIFactory.CreateScrollView(content, "PlayerScroll", 160);
+            _playerListContent = playerContent;
 
-            var content = new GameObject("Content", typeof(RectTransform));
-            content.transform.SetParent(scrollGo.transform, false);
-            _playerListContent = content.transform;
-            var cRt = content.GetComponent<RectTransform>();
-            cRt.anchorMin = new Vector2(0, 1); cRt.anchorMax = new Vector2(1, 1);
-            cRt.pivot = new Vector2(0.5f, 1); cRt.sizeDelta = Vector2.zero;
-            var cVlg = content.AddComponent<VerticalLayoutGroup>();
-            cVlg.spacing = 3; cVlg.padding = new RectOffset(6, 6, 6, 6);
-            cVlg.childForceExpandWidth = true; cVlg.childForceExpandHeight = false;
-            content.AddComponent<ContentSizeFitter>().verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-            scroll.content = cRt;
+            UIFactory.AddDivider(content);
 
             // Invite button
-            AddButton(pRt, "INVITE FRIEND", new Color(0.22f, 0.42f, 0.68f), 36, () =>
+            var inviteBtn = UIFactory.CreateButton(content, "InviteBtn", "Invite Friends  (Steam Overlay)",
+                UIFactory.ButtonSecondary, 13, 34);
+            inviteBtn.onClick.AddListener(() =>
             {
                 var lobby = SessionManager.Instance?.CurrentLobby;
                 if (lobby.HasValue)
                     SteamFriends.OpenGameInviteOverlay(lobby.Value.Id);
             });
 
-            // Button row
-            var btnRow = new GameObject("BtnRow", typeof(RectTransform));
-            btnRow.transform.SetParent(pRt, false);
-            btnRow.AddComponent<LayoutElement>().preferredHeight = 40;
-            var bhlg = btnRow.AddComponent<HorizontalLayoutGroup>();
-            bhlg.spacing = 12; bhlg.childForceExpandWidth = true;
+            UIFactory.AddSpacer(content, 4);
 
-            AddButton(btnRow.GetComponent<RectTransform>(), "CANCEL", new Color(0.5f, 0.18f, 0.18f), 0, OnCancelClicked);
-            AddButton(btnRow.GetComponent<RectTransform>(), "LAUNCH", new Color(0.18f, 0.52f, 0.18f), 0, OnLaunchClicked);
+            // ── Button row ──
+            var btnRow = new GameObject("BtnRow", typeof(RectTransform));
+            btnRow.transform.SetParent(content, false);
+            var btnRowLe = btnRow.AddComponent<LayoutElement>();
+            btnRowLe.preferredHeight = 36; btnRowLe.minHeight = 36;
+            var bhlg = btnRow.AddComponent<HorizontalLayoutGroup>();
+            bhlg.spacing = 12;
+            bhlg.childForceExpandWidth = true;
+            bhlg.childForceExpandHeight = true;
+            bhlg.childControlWidth = true;
+            bhlg.childControlHeight = true;
+
+            var cancelBtn = UIFactory.CreateButton(btnRow.GetComponent<RectTransform>(), "CancelBtn", "Cancel",
+                UIFactory.ButtonDanger, 13, 36);
+            cancelBtn.onClick.AddListener(OnCancelClicked);
+
+            var launchBtn = UIFactory.CreateButton(btnRow.GetComponent<RectTransform>(), "LaunchBtn", "Launch Game",
+                UIFactory.ButtonPrimary, 13, 36);
+            launchBtn.onClick.AddListener(OnLaunchClicked);
 
             RefreshPlayerList();
         }
@@ -360,33 +415,39 @@ namespace MineMogulMultiplayer.Patches
             if (session.Phase == SessionManager.LobbyPhase.InLobby)
             {
                 int count = session.LobbyPlayerNames.Count;
-                ShowOverlayStatus($"Lobby ready — {count} player{(count != 1 ? "s" : "")}. Invite friends, then click <b>LAUNCH</b>.");
+                ShowOverlayStatus($"Lobby ready \u2014 {count} player{(count != 1 ? "s" : "")}. Invite friends, then click Launch.");
             }
             else if (session.Phase == SessionManager.LobbyPhase.None)
             {
                 ShowOverlayStatus("Creating lobby...");
             }
 
-            foreach (var name in session.LobbyPlayerNames)
+            for (int i = 0; i < session.LobbyPlayerNames.Count; i++)
             {
-                var rowGo = new GameObject("PR", typeof(RectTransform));
-                rowGo.transform.SetParent(_playerListContent, false);
-                rowGo.AddComponent<Image>().color = new Color(0.14f, 0.14f, 0.18f, 1f);
-                rowGo.AddComponent<LayoutElement>().preferredHeight = 28;
+                var playerName = session.LobbyPlayerNames[i];
+                var row = UIFactory.CreatePanel(_playerListContent, "Player", UIFactory.RowBg, true);
+                row.gameObject.AddComponent<LayoutElement>().preferredHeight = 32;
+                var hlg = UIFactory.AddHorizontalLayout(row, 10);
+                hlg.padding = new RectOffset(10, 10, 0, 0);
+                hlg.childAlignment = TextAnchor.MiddleLeft;
 
-                var hlg2 = rowGo.AddComponent<HorizontalLayoutGroup>();
-                hlg2.padding = new RectOffset(10, 10, 2, 2);
-                hlg2.childAlignment = TextAnchor.MiddleLeft;
+                // Status dot
+                var dot = UIFactory.CreatePanel(row, "Dot", UIFactory.StatusGreen);
+                var dotLe = dot.gameObject.AddComponent<LayoutElement>();
+                dotLe.preferredWidth = 8; dotLe.preferredHeight = 8; dotLe.minWidth = 8;
 
-                // Green dot
-                var dot = new GameObject("Dot", typeof(RectTransform));
-                dot.transform.SetParent(rowGo.transform, false);
-                dot.AddComponent<Image>().color = new Color(0.35f, 0.82f, 0.35f, 1f);
-                var dotLe = dot.AddComponent<LayoutElement>();
-                dotLe.preferredWidth = 8; dotLe.preferredHeight = 8;
+                var nameText = UIFactory.CreateText(row, "Name", playerName, 14);
+                nameText.gameObject.AddComponent<LayoutElement>().flexibleWidth = 1;
 
-                AddText(rowGo.GetComponent<RectTransform>(), $"  {name}", 14, FontStyles.Normal, Color.white);
-                _playerRows.Add(rowGo);
+                if (i == 0)
+                {
+                    var hostLabel = UIFactory.CreateText(row, "Host", "HOST", 11);
+                    hostLabel.color = UIFactory.AccentGold;
+                    hostLabel.fontStyle = FontStyles.Bold;
+                    hostLabel.gameObject.AddComponent<LayoutElement>().preferredWidth = 40;
+                }
+
+                _playerRows.Add(row.gameObject);
             }
         }
 
@@ -420,53 +481,6 @@ namespace MineMogulMultiplayer.Patches
                 }
             }
             return null;
-        }
-
-        // ════════════════════════════════════════════
-        //  UI helpers
-        // ════════════════════════════════════════════
-
-        private static TextMeshProUGUI AddText(RectTransform parent, string text, int size,
-            FontStyles style, Color color)
-        {
-            var go = new GameObject("T", typeof(RectTransform));
-            go.transform.SetParent(parent, false);
-            var tmp = go.AddComponent<TextMeshProUGUI>();
-            tmp.text = text; tmp.fontSize = size; tmp.fontStyle = style; tmp.color = color;
-            return tmp;
-        }
-
-        private static void AddButton(RectTransform parent, string text, Color bg, int height, Action onClick)
-        {
-            var go = new GameObject("Btn", typeof(RectTransform));
-            go.transform.SetParent(parent, false);
-            var img = go.AddComponent<Image>();
-            img.color = bg;
-            if (height > 0)
-                go.AddComponent<LayoutElement>().preferredHeight = height;
-
-            var btn = go.AddComponent<Button>();
-            btn.targetGraphic = img;
-            var c = btn.colors;
-            c.highlightedColor = bg * 1.2f; c.pressedColor = bg * 0.8f;
-            btn.colors = c;
-            btn.onClick.AddListener(() => onClick());
-
-            var lbl = AddText(go.GetComponent<RectTransform>(), text, 14, FontStyles.Bold, Color.white);
-            lbl.alignment = TextAlignmentOptions.Center;
-            var lrt = lbl.GetComponent<RectTransform>();
-            lrt.anchorMin = Vector2.zero; lrt.anchorMax = Vector2.one;
-            lrt.offsetMin = lrt.offsetMax = Vector2.zero;
-        }
-
-        private static void MakeStretchedImage(Transform parent, string name, Color color)
-        {
-            var go = new GameObject(name, typeof(RectTransform));
-            go.transform.SetParent(parent, false);
-            go.AddComponent<Image>().color = color;
-            var rt = go.GetComponent<RectTransform>();
-            rt.anchorMin = Vector2.zero; rt.anchorMax = Vector2.one;
-            rt.offsetMin = rt.offsetMax = Vector2.zero;
         }
 
         // ════════════════════════════════════════════

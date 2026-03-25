@@ -2714,6 +2714,12 @@ namespace MineMogulMultiplayer.Core
                         var clientSoundMsg = NetSerializer.Deserialize<SoundEventMessage>(payload);
                         HandleSoundEventOnClient(clientSoundMsg);
                         break;
+                    case MessageType.KickPlayer:
+                        var kickMsg = NetSerializer.Deserialize<KickMessage>(payload);
+                        _log.LogWarning($"[Session] Kicked by host: {kickMsg.Reason}");
+                        LogEvent($"Kicked: {kickMsg.Reason}");
+                        Stop();
+                        break;
                 }
             }
             catch (Exception ex)
@@ -5622,6 +5628,25 @@ namespace MineMogulMultiplayer.Core
 
             return sb.ToString();
         }
+
+        /// <summary>Kick a connected client by their network ID. Host only.</summary>
+        public void KickClient(uint clientId)
+        {
+            if (!MultiplayerState.IsHost || _net == null) return;
+            string name = _clientNames.TryGetValue(clientId, out var n) ? n : $"ID {clientId}";
+            _log.LogInfo($"[Session] Kicking player '{name}' (clientId {clientId})");
+
+            // Send kick message so the client knows why they were disconnected
+            _net.SendToClient(clientId, MessageType.KickPlayer, new KickMessage { Reason = "Kicked by host" });
+
+            // Force-close the connection after a short delay isn't practical here,
+            // so close immediately — the kick message is sent reliably first
+            _net.DisconnectClient(clientId);
+            LogEvent($"Kicked {name}");
+        }
+
+        /// <summary>Get the dictionary of connected client IDs to names. Host only.</summary>
+        public IReadOnlyDictionary<uint, string> ConnectedClients => _clientNames;
 
         /// <summary>Force a full resync: host rebuilds snapshot for all clients, client requests resync from host.</summary>
         public void ForceResync()

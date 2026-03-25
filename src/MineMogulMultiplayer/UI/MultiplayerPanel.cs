@@ -62,6 +62,8 @@ namespace MineMogulMultiplayer.UI
         private Button _resyncBtn;
         private Button _dumpBtn;
         private Button _moneyBtn;
+        private RectTransform _inGamePlayerContent;
+        private readonly List<GameObject> _inGamePlayerRows = new List<GameObject>();
 
         // Debug overlay (always visible during gameplay when toggled)
         private Canvas _debugOverlayCanvas;
@@ -422,8 +424,18 @@ namespace MineMogulMultiplayer.UI
 
             UIFactory.AddDivider(rt);
 
+            // ── Connected Players Section ──
+            var playersLabel = UIFactory.CreateText(rt, "PlayersLabel", "CONNECTED PLAYERS", 12);
+            playersLabel.fontStyle = FontStyles.Bold;
+            playersLabel.color = UIFactory.TextColor;
+
+            var (_, playerContent) = UIFactory.CreateScrollView(rt, "InGamePlayers", 90);
+            _inGamePlayerContent = playerContent;
+
+            UIFactory.AddDivider(rt);
+
             // Invite button (in-game)
-            var invBtn = UIFactory.CreateButton(rt, "InviteInGame", "Invite Friends (Steam Overlay)",
+            var invBtn = UIFactory.CreateButton(rt, "InviteInGame", "Invite Friends  (Steam Overlay)",
                 UIFactory.ButtonSecondary, 12, 28);
             invBtn.onClick.AddListener(OnInvitePressed);
 
@@ -757,6 +769,9 @@ namespace MineMogulMultiplayer.UI
                 if (_moneyBtn != null) _moneyBtn.gameObject.SetActive(isHost);
                 if (_debugBotBtn != null) _debugBotBtn.gameObject.SetActive(isHost);
 
+                // Refresh in-game player list
+                RefreshInGamePlayerList();
+
                 // Update debug info in panel
                 UpdateDebugBotButton();
                 if (_debugInfoText != null && _session != null)
@@ -815,6 +830,74 @@ namespace MineMogulMultiplayer.UI
                 }
 
                 _playerRows.Add(row.gameObject);
+            }
+        }
+
+        private void RefreshInGamePlayerList()
+        {
+            foreach (var row in _inGamePlayerRows)
+                Destroy(row);
+            _inGamePlayerRows.Clear();
+
+            if (_session == null || _inGamePlayerContent == null) return;
+
+            bool isHost = MultiplayerState.IsHost;
+            string hostName = Plugin.Instance?.PlayerName ?? "Host";
+
+            // Host row (always first)
+            {
+                var row = UIFactory.CreatePanel(_inGamePlayerContent, "Player", UIFactory.RowBg, true);
+                row.gameObject.AddComponent<LayoutElement>().preferredHeight = 30;
+                var hlg = UIFactory.AddHorizontalLayout(row, 8);
+                hlg.padding = new RectOffset(8, 8, 0, 0);
+                hlg.childAlignment = TextAnchor.MiddleLeft;
+
+                var dot = UIFactory.CreatePanel(row, "Dot", UIFactory.StatusGreen);
+                var dotLe = dot.gameObject.AddComponent<LayoutElement>();
+                dotLe.preferredWidth = 8; dotLe.preferredHeight = 8; dotLe.minWidth = 8;
+
+                var nameText = UIFactory.CreateText(row, "Name", isHost ? hostName : "Host", 13);
+                nameText.gameObject.AddComponent<LayoutElement>().flexibleWidth = 1;
+
+                var hostTag = UIFactory.CreateText(row, "Tag", "HOST", 10);
+                hostTag.color = UIFactory.AccentGold;
+                hostTag.fontStyle = FontStyles.Bold;
+                hostTag.gameObject.AddComponent<LayoutElement>().preferredWidth = 36;
+
+                _inGamePlayerRows.Add(row.gameObject);
+            }
+
+            // Connected clients (host only has this data)
+            if (isHost)
+            {
+                foreach (var kv in _session.ConnectedClients)
+                {
+                    uint clientId = kv.Key;
+                    string clientName = kv.Value;
+
+                    var row = UIFactory.CreatePanel(_inGamePlayerContent, "Player", UIFactory.RowBg, true);
+                    row.gameObject.AddComponent<LayoutElement>().preferredHeight = 30;
+                    var hlg = UIFactory.AddHorizontalLayout(row, 8);
+                    hlg.padding = new RectOffset(8, 8, 0, 0);
+                    hlg.childAlignment = TextAnchor.MiddleLeft;
+
+                    var dot = UIFactory.CreatePanel(row, "Dot", UIFactory.StatusGreen);
+                    var dotLe = dot.gameObject.AddComponent<LayoutElement>();
+                    dotLe.preferredWidth = 8; dotLe.preferredHeight = 8; dotLe.minWidth = 8;
+
+                    var nameText = UIFactory.CreateText(row, "Name", clientName, 13);
+                    nameText.gameObject.AddComponent<LayoutElement>().flexibleWidth = 1;
+
+                    // Kick button
+                    var kickBtn = UIFactory.CreateButton(row, "KickBtn", "Kick",
+                        UIFactory.ButtonDanger, 10, 24);
+                    var kickLe = kickBtn.gameObject.GetComponent<LayoutElement>();
+                    kickLe.preferredWidth = 44; kickLe.flexibleWidth = 0;
+                    uint capturedId = clientId;
+                    kickBtn.onClick.AddListener(() => _session.KickClient(capturedId));
+
+                    _inGamePlayerRows.Add(row.gameObject);
+                }
             }
         }
 
