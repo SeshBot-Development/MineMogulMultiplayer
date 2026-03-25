@@ -1,7 +1,36 @@
+﻿# Build output
 bin/
 obj/
-build_out/
-*.zip
-*.user
+
+# IDE / editor
 .vs/
+.vscode/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Decompiled game code
+decompiled/
+decompiled_firstpass/
+decompiled_old/
+decompiled_sscc/
+game-analysis/
+
+# Tools (local dev only)
+tools/
+
+# Staging / packaging artifacts
+zip_staging/
+
+# Binary files
+*.dll
+*.zip
+*.bak
+
+# Misc dev scripts / files (local only)
+open-dnspy.bat
+publish-release.ps1
 update_token.txt

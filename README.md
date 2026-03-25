@@ -1,159 +1,75 @@
-# MineMogul Multiplayer Mod
+# MineMogul Multiplayer
 
-A host-authoritative multiplayer mod for MineMogul, built on BepInEx + Harmony + LiteNetLib.
+A **BepInEx 6** mod that adds peer-to-peer cooperative multiplayer to [Mine Mogul](https://store.steampowered.com/app/2680800/Mine_Mogul/) via **Steam Networking**.
 
-## Architecture
+## Features
 
-```
-┌──────────────────────────────────┐
-│          Plugin.cs (entry)       │
-├──────────────────────────────────┤
-│  MultiplayerUI     (IMGUI overlay, F9 toggle)
-│  SessionManager    (orchestrates host/client lifecycle)
-│  ├─ NetServer      (LiteNetLib, host-side)
-│  ├─ NetClient      (LiteNetLib, client-side)
-│  ├─ NetSerializer  (MessagePack envelope packing)
-│  └─ WorldHasher    (FNV-1a desync detection)
-│  Harmony Patches   (intercept game logic per role)
-│  Data Models       (GameState, Snapshots, Messages)
-└──────────────────────────────────┘
-```
+- **Steam P2P Lobby** — Host or join sessions through an in-game multiplayer panel (press **F9** or use the menu buttons). No port-forwarding required.
+- **Full World Sync** — Economy, research, quests, buildings, conveyors, machines, mining, and ore positions are kept in sync between host and clients.
+- **Mid-Game Joins** — New players can join an active session; the host automatically saves and reloads to bring them up to speed.
+- **Remote Players** — See other players' characters moving and interacting in the world.
+- **Force Resync** — Host can trigger a full save→reload→snapshot cycle to fix any desync.
+- **Kick Support** — Host can remove players from the session.
+- **Event Log** — On-screen feed of multiplayer events (joins, leaves, syncs, etc.).
+- **Auto-Updater** — The mod checks for new releases on GitHub and updates itself automatically on game launch.
+- **Configurable** — Player name and tick rate can be set in the BepInEx config.
 
-## Prerequisites
+## Requirements
 
-1. **MineMogul** installed via Steam
-2. **BepInEx 5.4.x** installed in the MineMogul folder
-   - Download from [Thunderstore](https://thunderstore.io/c/minemogul/) or [BepInEx releases](https://github.com/BepInEx/BepInEx/releases)
-   - Extract into your MineMogul game folder so `BepInEx/` sits next to `MineMogul.exe`
-3. **.NET SDK 6+** (for building)
-4. **dnSpy** or **ILSpy** (for reverse-engineering game assemblies)
+| Dependency | Version |
+|---|---|
+| [Mine Mogul](https://store.steampowered.com/app/2680800/Mine_Mogul/) | Latest |
+| [BepInEx 6](https://github.com/BepInEx/BepInEx) (Unity Mono, x64) | 6.0.0-be.697+ |
 
-## Setup
+## Installation
 
-### 1. Update paths in the .csproj
+### Easy — Download the bundle
 
-Open `src/MineMogulMultiplayer/MineMogulMultiplayer.csproj` and update:
+1. Grab the latest `MineMogulMultiplayer-vX.X.X-BepInEx-bundle.zip` from [Releases](https://github.com/SeshBot-Development/MineMogulMultiplayer/releases).
+2. Extract the ZIP into your Mine Mogul game folder (e.g. `C:\Program Files (x86)\Steam\steamapps\common\Mine Mogul\`).
+3. Launch the game.
 
-```xml
-<GameDir>C:\Program Files (x86)\Steam\steamapps\common\MineMogul</GameDir>
-```
+### Manual — DLL only
 
-to match your actual Steam library path.
+1. Install BepInEx 6 (Unity Mono, x64) into Go to your Mine Mogul game folder.
+2. Download `MineMogulMultiplayer.dll` from [Releases](https://github.com/SeshBot-Development/MineMogulMultiplayer/releases).
+3. Place it in `BepInEx\plugins\MineMogulMultiplayer\`.
+4. Launch the game.
 
-### 2. Restore and build
+## Usage
 
-```powershell
-cd src\MineMogulMultiplayer
-dotnet restore
-dotnet build
-```
+1. Open the multiplayer panel with **F9** or through the pause/main menu.
+2. **Host**: Click **Host Session** to create a lobby. Share the lobby info with friends.
+3. **Client**: Click **Join Session** and enter the host's Steam ID, or join through Steam friends.
+4. Both players must be on the same save/world state for initial sync to work correctly.
 
-The post-build step automatically copies the DLL + dependencies into:
-```
-<GameDir>\BepInEx\plugins\MineMogulMultiplayer\
-```
-
-### 3. Run the game
-
-Launch MineMogul. You should see `[MineMogul Multiplayer v0.1.0 loaded]` in the BepInEx console.
-
-Press **F9** to open the multiplayer menu.
-
-## How it works
-
-### Authority model: Host-authoritative
-
-- One player **hosts** — their game runs the real simulation.
-- Other players **join** — their game receives state from the host.
-- Clients send inputs/RPCs. The host validates and broadcasts results.
-
-### Network protocol
-
-| Direction | Message | Reliability |
-|-----------|---------|-------------|
-| Client → Host | `PlayerInput` | Sequenced |
-| Client → Host | `PlaceMachine`, `RemoveMachine`, `InteractMachine` | Reliable |
-| Host → Client | `WorldDelta` | Sequenced |
-| Host → Client | `WorldSnapshot` (on join) | Reliable |
-| Host → Client | `HashCheck` (periodic) | Reliable |
-
-### Harmony patching strategy
-
-Each game system gets a pair of patches:
-
-- **Prefix**: On clients, `return false` to skip simulation. On host, `return true` to run normally.
-- **Postfix** (host only): Mark the affected entity dirty so it gets included in the next delta broadcast.
-
-## Project structure
+## Building from Source
 
 ```
-src/MineMogulMultiplayer/
-├── Plugin.cs                    # BepInEx entry point
-├── MultiplayerUI.cs             # IMGUI host/join/disconnect menu
-├── Core/
-│   ├── PluginInfo.cs            # GUID, name, version constants
-│   ├── MultiplayerState.cs      # Global role tracker (Host/Client/Offline)
-│   └── SessionManager.cs        # Orchestrates networking + state
-├── Models/
-│   ├── NetPrimitives.cs         # NetVector3, NetQuaternion
-│   ├── GameState.cs             # PlayerState, MachineState, BeltState, etc.
-│   ├── Snapshots.cs             # WorldSnapshot, WorldDelta, WorldHash
-│   └── Messages.cs              # NetMessage envelope, RPCs, handshake
-├── Networking/
-│   ├── NetServer.cs             # Host-side LiteNetLib server
-│   └── NetClient.cs             # Client-side LiteNetLib connection
-├── Serialization/
-│   ├── NetSerializer.cs         # MessagePack pack/unpack
-│   └── WorldHasher.cs           # FNV-1a world state hashing
-└── Patches/
-    ├── MachineUpdatePatch.cs    # Template: machine tick interception
-    ├── BeltTickPatch.cs         # Template: conveyor tick interception
-    ├── ResourcePatch.cs         # Template: money/resource interception
-    └── PlacementPatch.cs        # Template: build/destroy interception
+git clone https://github.com/SeshBot-Development/MineMogulMultiplayer.git
+cd MineMogulMultiplayer
 ```
 
-## Next steps (your TODO list)
+1. Edit `MineMogulMultiplayer.csproj` and set `<GameDir>` to your Mine Mogul install path.
+2. Build:
+   ```
+   dotnet build --configuration Release
+   ```
+3. The output DLL is at `bin/Release/net472/MineMogulMultiplayer.dll`.
 
-### Phase 1: Reverse-engineer the game
-1. Open `Assembly-CSharp.dll` in dnSpy
-2. Find the classes for: machines, belts, player controller, resource/money system, building/placement system
-3. Map out which methods tick, which mutate state, which handle input
+## Project Structure
 
-### Phase 2: Wire up Harmony patches
-1. Uncomment the patch templates in `Patches/`
-2. Replace placeholder class/method names with real ones from dnSpy
-3. Test that singleplayer still works with patches active (all patches return `true` when offline)
-
-### Phase 3: Wire up state extraction
-1. In `SessionManager`, replace `GetLocalMoney()` and other TODOs with real game API reads
-2. Build snapshot/delta builders that read actual game objects
-3. Build snapshot appliers that spawn/update/destroy Unity GameObjects on clients
-
-### Phase 4: Test multiplayer
-1. Host on one machine, join from another (or two instances on localhost)
-2. Verify money sync, machine placement sync, machine state sync
-3. Add belt/item sync last (highest complexity)
-
-### Phase 5: Polish
-1. Add chat
-2. Add player name tags
-3. Handle save/load in multiplayer context
-4. Desync recovery (auto-resync on hash mismatch)
-
-## Config
-
-Config file is auto-generated at `BepInEx/config/com.minemogul.multiplayer.cfg`:
-
-```ini
-[Network]
-Port = 7777
-PlayerName = Player
-TickRate = 20
+```
+Core/           Session management, state tracking, remote player manager
+Models/         Network message types, game state snapshots, primitives
+Networking/     Steam P2P transport layer
+Patches/        Harmony patches for game systems (economy, mining, building, etc.)
+Serialization/  Binary serialization and world hashing
+UI/             Multiplayer panel, event log, UI factory
+Updater/        GitHub-based auto-updater
+Plugin.cs       BepInEx plugin entry point
 ```
 
-## Troubleshooting
+## License
 
-- **DLL not loading**: Make sure BepInEx is installed correctly. Check `BepInEx/LogOutput.log`.
-- **Build errors about missing references**: Update `<GameDir>` in the .csproj. The game's DLL names may differ slightly — check `MineMogul_Data/Managed/`.
-- **Patches crash the game**: Start with all patches commented out. Enable one at a time.
-- **Desync**: Check hash mismatch logs. The most common cause is a game system you forgot to suppress on clients.
+This project is provided as-is for personal and community use. Not affiliated with or endorsed by the developers of Mine Mogul.
