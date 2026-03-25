@@ -51,15 +51,21 @@ namespace MineMogulMultiplayer
 
             // Config
             _cfgPlayerName = Config.Bind("Network", "PlayerName", "Player", "Display name in multiplayer.");
-            // If the config is still the default "Player", use the Steam display name instead
-            if (_cfgPlayerName.Value == "Player" && !string.IsNullOrEmpty(SteamClient.Name))
-                _cfgPlayerName.Value = SteamClient.Name;
             _cfgTickRate = Config.Bind("Network", "TickRate", 20, "State updates per second (host only).");
 
             _tickInterval = 1f / _cfgTickRate.Value;
 
             // Session manager (also initializes Steamworks)
             _session = new SessionManager(Logger);
+
+            // If the config is still the default "Player", use the Steam display name instead
+            // Must be done AFTER SessionManager init since that initializes Steamworks
+            try
+            {
+                if (_cfgPlayerName.Value == "Player" && !string.IsNullOrEmpty(SteamClient.Name))
+                    _cfgPlayerName.Value = SteamClient.Name;
+            }
+            catch { /* Steam not ready yet — keep default */ }
 
             // UI — Event log (always visible during gameplay)
             EventLog = gameObject.AddComponent<EventLog>();
