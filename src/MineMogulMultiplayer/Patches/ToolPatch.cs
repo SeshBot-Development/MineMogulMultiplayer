@@ -1,5 +1,6 @@
 using HarmonyLib;
 using MineMogulMultiplayer.Core;
+using MineMogulMultiplayer.Models;
 using UnityEngine;
 
 namespace MineMogulMultiplayer.Patches
@@ -42,7 +43,6 @@ namespace MineMogulMultiplayer.Patches
             else if (MultiplayerState.IsHost)
             {
                 session.BroadcastToolWorldDrop(toolName, pos, rot, vel);
-                session.ScheduleInventoryBroadcast();
             }
         }
 
@@ -61,14 +61,82 @@ namespace MineMogulMultiplayer.Patches
 
             if (MultiplayerState.IsClient)
             {
-                // Client: tell host to add this tool to shared inventory
                 session.SendToolPickupRPC(toolName);
             }
             else if (MultiplayerState.IsHost)
             {
                 session.BroadcastToolWorldPickup(toolName);
-                session.ScheduleInventoryBroadcast();
             }
+        }
+
+        // ── ToolDebugSpawnTool (ore spawner tool) ────────────────
+
+        /// <summary>Client: suppress local SpawnObject and send RPC to host instead.</summary>
+        [HarmonyPatch(typeof(ToolDebugSpawnTool), "SpawnObject")]
+        [HarmonyPrefix]
+        public static bool Prefix_ToolDebugSpawnTool_SpawnObject(ToolDebugSpawnTool __instance)
+        {
+            if (!MultiplayerState.IsOnline) return true;
+            if (MultiplayerState.IsHost) return true; // host spawns normally; DetectOreChanges picks it up
+
+            var session = SessionManager.Instance;
+            if (session == null) return true;
+
+            // Replicate the same raycast logic as the original method
+            var cam = __instance.Owner?.GetComponentInChildren<Camera>();
+            if (cam == null) return false;
+
+            RaycastHit hitInfo;
+            Vector3 spawnPos;
+            if (Physics.Raycast(cam.transform.position, cam.transform.forward, out hitInfo, __instance.SpawnRange, __instance.HitLayers))
+                spawnPos = hitInfo.point - cam.transform.forward * 0.25f;
+            else
+                spawnPos = cam.transform.position + cam.transform.forward * __instance.SpawnRange;
+
+            session.SendSpawnOreRPC(
+                (int)__instance.SelectedResourceType,
+                (int)__instance.SelectedPieceType,
+                __instance.SelectedIsPolished,
+                spawnPos, Quaternion.identity,
+                Vector3.zero, Vector3.zero);
+
+            return false; // suppress local spawn
+        }
+
+        /// <summary>Client: suppress local LaunchObject and send RPC to host instead.</summary>
+        [HarmonyPatch(typeof(ToolDebugSpawnTool), "LaunchObject")]
+        [HarmonyPrefix]
+        public static bool Prefix_ToolDebugSpawnTool_LaunchObject(ToolDebugSpawnTool __instance)
+        {
+            if (!MultiplayerState.IsOnline) return true;
+            if (MultiplayerState.IsHost) return true;
+
+            var session = SessionManager.Instance;
+            if (session == null) return true;
+
+            var cam = __instance.Owner?.GetComponentInChildren<Camera>();
+            if (cam == null) return false;
+
+            Vector3 position = cam.transform.position + cam.transform.forward * 1f;
+            Vector3 forward = Quaternion.Euler(
+                Random.Range(-__instance.AngleSpread, __instance.AngleSpread),
+                Random.Range(-__instance.AngleSpread, __instance.AngleSpread), 0f) * cam.transform.forward;
+            Quaternion rotation = Quaternion.LookRotation(forward);
+
+            Vector3 force = forward.normalized * __instance.LaunchForce;
+            Vector3 torque = new Vector3(
+                Random.Range(-__instance.SpinForce, __instance.SpinForce),
+                Random.Range(-__instance.SpinForce, __instance.SpinForce),
+                Random.Range(-__instance.SpinForce, __instance.SpinForce));
+
+            session.SendSpawnOreRPC(
+                (int)__instance.SelectedResourceType,
+                (int)__instance.SelectedPieceType,
+                __instance.SelectedIsPolished,
+                position, rotation,
+                force, torque);
+
+            return false;
         }
     }
 }

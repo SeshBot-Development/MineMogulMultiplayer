@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -128,6 +128,7 @@ namespace MineMogulMultiplayer.Core
 
         // ── Remotely-held ore kinematic management ──
         private readonly Dictionary<int, float> _remotelyHeldOres = new Dictionary<int, float>(); // netId → lastUpdateTime
+        private readonly Dictionary<int, Vector3> _lastRemoteOreVelocity = new Dictionary<int, Vector3>(); // netId → last known velocity
         private readonly Dictionary<int, float> _remotelyHeldCrates = new Dictionary<int, float>(); // netId → lastUpdateTime
         private const float RemoteHoldTimeout = 0.8f; // seconds before ore returns to physics
 
@@ -1120,13 +1121,6 @@ namespace MineMogulMultiplayer.Core
 
             // Inventory sync disabled — each player has their own independent inventory
 
-            // Broadcast inventory if a tool was dropped/picked up
-            if (_pendingInventoryBroadcast)
-            {
-                _pendingInventoryBroadcast = false;
-                BroadcastInventorySync();
-            }
-
             if (_tick % HashCheckInterval == 0)
             {
                 var snapshot = BuildSnapshot();
@@ -1228,11 +1222,13 @@ namespace MineMogulMultiplayer.Core
                 }
 
                 _lastSentOrePositions[netId] = pos;
+                var rb = ore.GetComponent<Rigidbody>();
                 _poolOrePositionUpdates.Add(new OrePositionUpdate
                 {
                     NetworkId = netId,
                     Position = new NetVector3(pos),
-                    Rotation = new NetQuaternion(ore.transform.rotation)
+                    Rotation = new NetQuaternion(ore.transform.rotation),
+                    Velocity = rb != null ? new NetVector3(rb.linearVelocity) : default
                 });
             }
 
@@ -1326,6 +1322,7 @@ namespace MineMogulMultiplayer.Core
                         rb.linearVelocity = Vector3.zero;
                         rb.angularVelocity = Vector3.zero;
                     }
+                    _lastRemoteOreVelocity[upd.NetworkId] = upd.Velocity.ToUnity();
                     _remotelyHeldOres[upd.NetworkId] = UnityEngine.Time.unscaledTime;
                 }
             }
@@ -1371,8 +1368,14 @@ namespace MineMogulMultiplayer.Core
                     if (foundOre != null)
                     {
                         var rb = foundOre.GetComponent<Rigidbody>();
-                        if (rb != null) rb.isKinematic = false;
+                        if (rb != null)
+                        {
+                            rb.isKinematic = false;
+                            if (_lastRemoteOreVelocity.TryGetValue(netId, out var vel))
+                                rb.linearVelocity = vel;
+                        }
                     }
+                    _lastRemoteOreVelocity.Remove(netId);
                 }
             }
 
@@ -1763,9 +1766,9 @@ namespace MineMogulMultiplayer.Core
             _clientLocallyHeldOres.Add(netId);
 
             // Make sure the ore is non-kinematic so the client can move it
-            var rb = ore.GetComponent<Rigidbody>();
-            if (rb != null && rb.isKinematic)
-                rb.isKinematic = false;
+            var oreRb = ore.GetComponent<Rigidbody>();
+            if (oreRb != null && oreRb.isKinematic)
+                oreRb.isKinematic = false;
 
             var pos = ore.transform.position;
             if (_clientLastSentOrePos.TryGetValue(netId, out var lastPos))
@@ -1779,7 +1782,8 @@ namespace MineMogulMultiplayer.Core
             {
                 NetworkId = netId,
                 Position = new NetVector3(pos),
-                Rotation = new NetQuaternion(ore.transform.rotation)
+                Rotation = new NetQuaternion(ore.transform.rotation),
+                Velocity = oreRb != null ? new NetVector3(oreRb.linearVelocity) : new NetVector3(Vector3.zero)
             });
         }
 
@@ -2606,6 +2610,11 @@ namespace MineMogulMultiplayer.Core
                         var toolPickup = NetSerializer.Deserialize<ToolPickupMessage>(payload);
                         HandleToolPickup(clientId, toolPickup);
                         break;
+
+                    case MessageType.SpawnOre:
+                        var spawnOreMsg = NetSerializer.Deserialize<SpawnOreMessage>(payload);
+                        HandleSpawnOre(clientId, spawnOreMsg);
+                        break;
                 }
             }
             catch (Exception ex)
@@ -2712,9 +2721,7 @@ namespace MineMogulMultiplayer.Core
                         ApplyCratePositionUpdates(crateUpdates);
                         break;
                     case MessageType.InventorySync:
-                        var invSync = NetSerializer.Deserialize<InventorySyncMessage>(payload);
-                        if (invSync?.Tools != null && invSync.Tools.Length > 0)
-                            ReconcileToolInventory(invSync.Tools);
+                        // Inventories are independent per player; ignore tool sync from host
                         break;
                     case MessageType.ItemDropped:
                         if (_clientWaitingForSnapshot) break;
@@ -4037,6 +4044,7 @@ namespace MineMogulMultiplayer.Core
             _oreTargetPositions.Remove(networkId);
             _oreTargetRotations.Remove(networkId);
             _remotelyHeldOres.Remove(networkId);
+            _lastRemoteOreVelocity.Remove(networkId);
         }
 
         /// <summary>Apply ore position updates from host — smoothly moves ore pieces that have changed position.</summary>
@@ -4061,6 +4069,11 @@ namespace MineMogulMultiplayer.Core
                         rb.angularVelocity = Vector3.zero;
                     }
                     _remotelyHeldOres[upd.NetworkId] = UnityEngine.Time.unscaledTime;
+
+                    // Store last known velocity so we can apply it when releasing
+                    var vel = upd.Velocity.ToUnity();
+                    if (vel.sqrMagnitude > 0.001f)
+                        _lastRemoteOreVelocity[upd.NetworkId] = vel;
                 }
             }
         }
@@ -4786,10 +4799,6 @@ namespace MineMogulMultiplayer.Core
             _log.LogInfo($"[Session] Sent tool pickup RPC: {toolName}");
         }
 
-        private bool _pendingInventoryBroadcast;
-        /// <summary>Schedule an inventory broadcast on the next tick (used after host tool changes).</summary>
-        public void ScheduleInventoryBroadcast() { _pendingInventoryBroadcast = true; }
-
         /// <summary>Host: handle a client purchase notification — deduct shared money only (inventories are independent).</summary>
         private void HandleShopPurchaseNotify(uint clientId, ShopPurchaseNotifyMessage msg)
         {
@@ -4806,25 +4815,21 @@ namespace MineMogulMultiplayer.Core
             }
         }
 
-        /// <summary>Host: a client dropped a tool — drop from host inventory at client's position, broadcast to all.</summary>
+        /// <summary>Host: a client dropped a tool — spawn world copy at their position, broadcast to all.
+        /// Does NOT remove from host inventory — inventories are independent per player.</summary>
         private void HandleToolDrop(uint clientId, ToolDropMessage msg)
         {
             _log.LogInfo($"[Session] Client {clientId} dropped tool '{msg.ToolName}'");
 
-            // Remove from host inventory and destroy (we'll spawn a fresh world copy)
-            RemoveToolFromHostInventory(msg.ToolName);
-
-            // Spawn a world-visible copy at the client's drop position
+            // Spawn a world-visible copy at the client's drop position (host sees it on ground)
             SpawnWorldTool(msg.ToolName, msg.Position.ToUnity(), msg.Rotation.ToUnity(), msg.Velocity.ToUnity());
 
             // Broadcast to ALL clients so they see the world object
-            // (the dropping client ignores their own PlayerId)
             _net.SendToAll(MessageType.ToolDrop, msg);
-
-            BroadcastInventorySync();
         }
 
-        /// <summary>Host: a client picked up a tool from the ground — add to host inventory, clean up world copies.</summary>
+        /// <summary>Host: a client picked up a tool from the ground — clean up world copies.
+        /// Does NOT add to host inventory — inventories are independent per player.</summary>
         private void HandleToolPickup(uint clientId, ToolPickupMessage msg)
         {
             _log.LogInfo($"[Session] Client {clientId} picked up tool '{msg.ToolName}'");
@@ -4832,12 +4837,8 @@ namespace MineMogulMultiplayer.Core
             // Destroy the world copy on the host side
             DestroyDroppedWorldTool(msg.ToolName);
 
-            AddToolToHostInventory(msg.ToolName);
-
             // Broadcast to all clients so they destroy their world copies
             _net.SendToAll(MessageType.ToolPickup, msg);
-
-            BroadcastInventorySync();
         }
 
         /// <summary>Host → all clients: a tool was dropped — spawn a world object.</summary>
@@ -5017,6 +5018,49 @@ namespace MineMogulMultiplayer.Core
                 Damage = damage,
                 HitPosition = hitPos
             });
+        }
+
+        // ── Ore spawn RPC (client → host) ──────────────────────────
+
+        public void SendSpawnOreRPC(int resourceType, int pieceType, bool isPolished,
+            Vector3 pos, Quaternion rot, Vector3 force, Vector3 torque)
+        {
+            if (!MultiplayerState.IsClient || _net == null) return;
+            _net.SendToHost(MessageType.SpawnOre, new SpawnOreMessage
+            {
+                PlayerId   = MultiplayerState.LocalPlayerId,
+                ResourceType = resourceType,
+                PieceType    = pieceType,
+                IsPolished   = isPolished,
+                Position = new NetVector3(pos),
+                Rotation = new NetQuaternion(rot),
+                Force    = new NetVector3(force),
+                Torque   = new NetVector3(torque)
+            });
+        }
+
+        private void HandleSpawnOre(uint clientId, SpawnOreMessage msg)
+        {
+            var poolMgr = Singleton<OrePiecePoolManager>.Instance;
+            if (poolMgr == null) return;
+            var ore = poolMgr.SpawnPooledOre(
+                (ResourceType)msg.ResourceType,
+                (PieceType)msg.PieceType,
+                msg.IsPolished,
+                msg.Position.ToUnity(),
+                msg.Rotation.ToUnity(),
+                null);
+            if (ore != null)
+            {
+                var rb = ore.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    var force  = msg.Force.ToUnity();
+                    var torque = msg.Torque.ToUnity();
+                    if (force.sqrMagnitude  > 0f) rb.AddForce(force, ForceMode.Impulse);
+                    if (torque.sqrMagnitude > 0f) rb.AddTorque(torque, ForceMode.Impulse);
+                }
+            }
         }
 
         /// <summary>Client applies a remote mining event: finds closest node and deals damage locally.</summary>
@@ -5901,6 +5945,7 @@ namespace MineMogulMultiplayer.Core
             _crateTargetPositions.Clear();
             _crateTargetRotations.Clear();
             _remotelyHeldOres.Clear();
+            _lastRemoteOreVelocity.Clear();
             _remotelyHeldCrates.Clear();
             _prevHeldObjectId = null;
             _prevHeldObjectVelocity = Vector3.zero;

@@ -28,6 +28,7 @@ namespace MineMogulMultiplayer.Models
         ResearchItem     = 25,
         CrateDamage      = 26,
         ToolDrop         = 27,
+        SpawnOre         = 28,
 
         // Host → Client events
         BuildingSpawned  = 30,
@@ -151,6 +152,19 @@ namespace MineMogulMultiplayer.Models
         [Key(1)] public string ToolName;
     }
 
+    [MessagePackObject]
+    public class SpawnOreMessage
+    {
+        [Key(0)] public int PlayerId;
+        [Key(1)] public int ResourceType;
+        [Key(2)] public int PieceType;
+        [Key(3)] public bool IsPolished;
+        [Key(4)] public NetVector3 Position;
+        [Key(5)] public NetQuaternion Rotation;
+        [Key(6)] public NetVector3 Force;
+        [Key(7)] public NetVector3 Torque;
+    }
+
     // ──────────────────────────────────────────────
     //  Handshake
     // ──────────────────────────────────────────────
@@ -196,6 +210,7 @@ namespace MineMogulMultiplayer.Models
         [Key(0)] public int NetworkId;
         [Key(1)] public NetVector3 Position;
         [Key(2)] public NetQuaternion Rotation;
+        [Key(3)] public NetVector3 Velocity;
     }
 
     [MessagePackObject]
