@@ -5725,16 +5725,58 @@ namespace MineMogulMultiplayer.Core
         /// <summary>Get the dictionary of connected client IDs to names. Host only.</summary>
         public IReadOnlyDictionary<uint, string> ConnectedClients => _clientNames;
 
-        /// <summary>Force a full resync: host rebuilds snapshot for all clients, client requests resync from host.</summary>
+        /// <summary>Force a full resync: host saves, reloads the world from disk, and sends a fresh snapshot to all clients.
+        /// Client requests the host to perform the resync.</summary>
         public void ForceResync()
         {
             if (MultiplayerState.IsHost && _net != null)
             {
                 if (!IsGameSceneReady()) { _log.LogWarning("[Debug] Scene not ready for resync"); return; }
-                var snapshot = BuildSnapshot();
-                _net.SendToAll(MessageType.FullSnapshot, snapshot);
-                _log.LogInfo("[Debug] Force-sent full snapshot to all clients");
-                LogEvent("Force resync sent to all clients.");
+                if (_reloadingForJoin) { _log.LogWarning("[Debug] Already reloading"); return; }
+
+                _reloadingForJoin = true;
+                try
+                {
+                    var slm = Singleton<SavingLoadingManager>.Instance;
+                    if (slm == null)
+                    {
+                        _log.LogError("[Session] SavingLoadingManager not found — cannot force resync");
+                        _reloadingForJoin = false;
+                        return;
+                    }
+
+                    // 1. Save current game to disk
+                    slm.SaveGameWithActiveSaveFileName();
+                    SaveMultiplayerCompanionData();
+
+                    // 2. Determine full save path
+                    string fullPath = _hostSaveFilePath;
+                    if (string.IsNullOrEmpty(fullPath))
+                    {
+                        fullPath = SavingLoadingManager.GetFullSaveFilePath(slm.ActiveSaveFileName);
+                        _hostSaveFilePath = fullPath;
+                    }
+
+                    // 3. Reload in-place — destroys all objects and recreates from save
+                    slm.LoadGame(fullPath);
+                    _log.LogInfo("[Debug] Force resync: saved and reloaded world from disk");
+
+                    // 4. Reinitialise ore tracking (instance IDs change after reload)
+                    InitializeKnownOres();
+
+                    // 5. Wait a few frames for physics to settle, then send fresh snapshots
+                    _reloadResyncFrames = 5;
+
+                    LogEvent("Force resync — world saved and reloaded.");
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError($"[Session] ForceResync failed: {ex}");
+                }
+                finally
+                {
+                    _reloadingForJoin = false;
+                }
             }
             else if (MultiplayerState.IsClient && _net != null)
             {
