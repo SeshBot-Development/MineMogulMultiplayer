@@ -12,17 +12,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Find the BepInEx bundle ZIP asset from the release
+          # Find the ZIP asset from the release (MineMogulMultiplayer-v*.zip)
           ASSET_URL=$(gh api repos/${{ github.repository }}/releases/${{ github.event.release.id }}/assets \
-            --jq '.[] | select(.name | test("BepInEx-bundle\\.zip$")) | .url')
+            --jq '.[] | select(.name | test("\\.zip$")) | .url')
 
           if [ -z "$ASSET_URL" ]; then
-            echo "::error::No BepInEx bundle ZIP found in release assets"
+            echo "::error::No ZIP file found in release assets"
             exit 1
           fi
 
           ASSET_NAME=$(gh api repos/${{ github.repository }}/releases/${{ github.event.release.id }}/assets \
-            --jq '.[] | select(.name | test("BepInEx-bundle\\.zip$")) | .name')
+            --jq '.[] | select(.name | test("\\.zip$")) | .name')
 
           gh api "$ASSET_URL" -H "Accept: application/octet-stream" > "$ASSET_NAME"
           echo "ASSET_NAME=$ASSET_NAME" >> $GITHUB_ENV
