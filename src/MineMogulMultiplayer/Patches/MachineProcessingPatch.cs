@@ -428,5 +428,36 @@ namespace MineMogulMultiplayer.Patches
             if (MultiplayerState.IsHost) return true;
             return false;
         }
+
+        // ── OreSpawnerMacine ─────────────────────────
+
+        [HarmonyPatch(typeof(OreSpawnerMacine), "Update")]
+        [HarmonyPrefix]
+        public static bool Prefix_OreSpawnerMacine_Update()
+        {
+            if (!MultiplayerState.IsOnline) return true;
+            if (MultiplayerState.IsHost) return true;
+            return false; // client: suppress ore spawning
+        }
+
+        [HarmonyPatch(typeof(OreSpawnerMacine), "TrySpawnOre")]
+        [HarmonyPrefix]
+        public static bool Prefix_OreSpawnerMacine_TrySpawnOre()
+        {
+            if (!MultiplayerState.IsOnline) return true;
+            if (MultiplayerState.IsHost) return true;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(OreSpawnerMacine), "TrySpawnOre")]
+        [HarmonyPostfix]
+        public static void Postfix_OreSpawnerMacine_TrySpawnOre(OreSpawnerMacine __instance)
+        {
+            if (!MultiplayerState.IsOnline || !MultiplayerState.IsHost) return;
+            // Find parent BuildingObject to get instance ID for dirty tracking
+            var bo = __instance.GetComponentInParent<BuildingObject>();
+            if (bo != null)
+                DirtyTracker.DirtyMachineInstanceIds.Add(bo.GetInstanceID());
+        }
     }
 }

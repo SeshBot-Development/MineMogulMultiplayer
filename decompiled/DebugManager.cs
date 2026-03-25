@@ -88,6 +88,15 @@ public class DebugManager : Singleton<DebugManager>
 		}
 	}
 
+	public bool ShoudlAllowUnlimitedBuilding()
+	{
+		if (!UnlimitedBuilding)
+		{
+			return Singleton<GamemodeManager>.Instance.ShouldUseFreeShop();
+		}
+		return true;
+	}
+
 	public void ClearAllPhysicsOrePieces(bool keepOrePiecesThatAreInBaskets = true)
 	{
 		HashSet<OrePiece> hashSet = new HashSet<OrePiece>();

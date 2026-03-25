@@ -23,6 +23,8 @@ public class SaveFile
 
 	public bool IsDemoVersion;
 
+	public GameModeType GameMode;
+
 	public Vector3 PlayerPosition = Vector3.zero;
 
 	public Vector3 PlayerRotation = Vector3.zero;
@@ -46,4 +48,6 @@ public class SaveFile
 	public List<SavableObjectID> CompletedResearchItems = new List<SavableObjectID>();
 
 	public bool HasShownOreLimitPopup;
+
+	public int LastActiveInventorySlot;
 }

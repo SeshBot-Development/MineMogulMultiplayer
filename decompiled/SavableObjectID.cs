@@ -147,5 +147,8 @@ public enum SavableObjectID
 	BreakableCrateSmall_Empty = 1101,
 	BreakableCrateMedium = 1102,
 	BreakableCrateTall = 1104,
-	DetonatorBoombox_Physics = 1106
+	DetonatorBoombox_Physics = 1106,
+	MobileDepositor_T1 = 1200,
+	MobileDepositor_T2 = 1201,
+	ItemSpawnerConveyor = 1202
 }

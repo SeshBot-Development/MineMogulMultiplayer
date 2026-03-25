@@ -26,7 +26,7 @@ public class QuestManager : Singleton<QuestManager>
 		{
 			Quest item = allQuestDefinition.GenerateQuest();
 			AllQuests.Add(item);
-			if (allQuestDefinition == StartingQuest)
+			if (allQuestDefinition == StartingQuest && !Singleton<GamemodeManager>.Instance.ShouldDisableQuests())
 			{
 				ActiveQuests.Add(item);
 			}
@@ -198,7 +198,10 @@ public class QuestManager : Singleton<QuestManager>
 
 	public void TryGiveResearchTreeQuest()
 	{
-		TryActivateQuest(GetQuestByID(QuestID.Open_ResearchTree));
+		if (Singleton<GamemodeManager>.Instance.GameModeType != GameModeType.Sandbox)
+		{
+			TryActivateQuest(GetQuestByID(QuestID.Open_ResearchTree));
+		}
 	}
 
 	public void TryGiveInventoryQuest()

@@ -93,6 +93,14 @@ public class ShopItemButton : MonoBehaviour
 		}
 		float num = ShopItem.GetPrice() * _quantity;
 		bool flag = Singleton<EconomyManager>.Instance.Money - (float)_shopUI.TotalCartPrice >= num && !ShopItem.IsLocked;
+		if (Singleton<GamemodeManager>.Instance.ShouldUseFreeShop())
+		{
+			flag = true;
+			if (ShopItem.IsLocked)
+			{
+				ShopItem.IsLocked = false;
+			}
+		}
 		Button.interactable = flag;
 		if (_quantity == 1)
 		{

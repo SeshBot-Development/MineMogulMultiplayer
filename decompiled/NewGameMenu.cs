@@ -25,9 +25,17 @@ public class NewGameMenu : MonoBehaviour
 	[SerializeField]
 	private MapSelectButton _mapSelectButtonPrefab;
 
+	[SerializeField]
+	private Toggle _standardGamemodeToggle;
+
+	[SerializeField]
+	private Toggle _sandboxGamemodeToggle;
+
 	private List<MapSelectButton> _mapSelectButtons = new List<MapSelectButton>();
 
 	private LevelInfo _selectedLevelInfo;
+
+	private GameModeType _selectedGameMode;
 
 	private static readonly char[] InvalidChars = Path.GetInvalidFileNameChars();
 
@@ -54,14 +62,30 @@ public class NewGameMenu : MonoBehaviour
 		_newSaveFileNameInputField.onEndEdit.AddListener(OnInputSubmitted);
 		TMP_InputField newSaveFileNameInputField = _newSaveFileNameInputField;
 		newSaveFileNameInputField.onValidateInput = (TMP_InputField.OnValidateInput)Delegate.Combine(newSaveFileNameInputField.onValidateInput, new TMP_InputField.OnValidateInput(ValidateChar));
+		_standardGamemodeToggle.onValueChanged.AddListener(OnStandardGamemodeToggleChanged);
+		_sandboxGamemodeToggle.onValueChanged.AddListener(OnSandboxGamemodeToggleChanged);
 	}
 
 	public void OnMapSelected(MapSelectButton mapSelectButton)
 	{
+		bool flag = _selectedLevelInfo != null && _selectedLevelInfo.ShouldForceSandboxGamemode;
 		_selectedLevelInfo = mapSelectButton.LevelInfo;
 		foreach (MapSelectButton mapSelectButton2 in _mapSelectButtons)
 		{
 			mapSelectButton2.UpdateSelected(mapSelectButton2 == mapSelectButton);
+		}
+		if (_selectedLevelInfo.ShouldForceSandboxGamemode)
+		{
+			_selectedGameMode = GameModeType.Sandbox;
+			_standardGamemodeToggle.interactable = false;
+			_sandboxGamemodeToggle.isOn = true;
+			return;
+		}
+		_standardGamemodeToggle.interactable = true;
+		if (_selectedGameMode == GameModeType.Sandbox && flag)
+		{
+			_selectedGameMode = GameModeType.Standard;
+			_standardGamemodeToggle.isOn = true;
 		}
 	}
 
@@ -70,6 +94,24 @@ public class NewGameMenu : MonoBehaviour
 		_newSaveFileNameInputField.onEndEdit.RemoveListener(OnInputSubmitted);
 		TMP_InputField newSaveFileNameInputField = _newSaveFileNameInputField;
 		newSaveFileNameInputField.onValidateInput = (TMP_InputField.OnValidateInput)Delegate.Remove(newSaveFileNameInputField.onValidateInput, new TMP_InputField.OnValidateInput(ValidateChar));
+		_standardGamemodeToggle.onValueChanged.RemoveListener(OnStandardGamemodeToggleChanged);
+		_sandboxGamemodeToggle.onValueChanged.RemoveListener(OnSandboxGamemodeToggleChanged);
+	}
+
+	private void OnStandardGamemodeToggleChanged(bool value)
+	{
+		if (value)
+		{
+			_selectedGameMode = GameModeType.Standard;
+		}
+	}
+
+	private void OnSandboxGamemodeToggleChanged(bool value)
+	{
+		if (value)
+		{
+			_selectedGameMode = GameModeType.Sandbox;
+		}
 	}
 
 	private void Update()
@@ -82,6 +124,11 @@ public class NewGameMenu : MonoBehaviour
 		if (!string.IsNullOrEmpty(_newSaveFileNameInputField.text) && !SaveFileNameAlreadyExists(_newSaveFileNameInputField.text))
 		{
 			Debug.Log("Loading level '" + _selectedLevelInfo.LevelID + "' with new Save File: " + _newSaveFileNameInputField.text);
+			if (_selectedLevelInfo.ShouldForceSandboxGamemode)
+			{
+				_selectedGameMode = GameModeType.Sandbox;
+			}
+			Singleton<GamemodeManager>.Instance.GameModeType = _selectedGameMode;
 			Singleton<SavingLoadingManager>.Instance.LoadSceneAndStartNewSaveFile(_newSaveFileNameInputField.text, _selectedLevelInfo.SceneName);
 			base.gameObject.SetActive(value: false);
 		}

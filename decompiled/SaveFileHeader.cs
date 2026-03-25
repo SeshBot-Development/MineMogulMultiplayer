@@ -21,6 +21,8 @@ public class SaveFileHeader
 
 	public bool IsDemoVersion;
 
+	public GameModeType GameMode;
+
 	public bool IsPlayableInDemoVersion()
 	{
 		if (IsDemoVersion)

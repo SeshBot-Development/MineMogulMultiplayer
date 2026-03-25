@@ -251,6 +251,14 @@ public class PauseMenu : MonoBehaviour
 				autoMiner.Toggle(on: false);
 			}
 		}
+		OreSpawnerMacine[] array2 = Object.FindObjectsOfType<OreSpawnerMacine>();
+		foreach (OreSpawnerMacine oreSpawnerMacine in array2)
+		{
+			if (oreSpawnerMacine.enabled)
+			{
+				oreSpawnerMacine.Toggle(on: false);
+			}
+		}
 	}
 
 	public void OnTurnOnAllAutoMinersPressed()
@@ -261,6 +269,14 @@ public class PauseMenu : MonoBehaviour
 			if (autoMiner.enabled)
 			{
 				autoMiner.Toggle(on: true);
+			}
+		}
+		OreSpawnerMacine[] array2 = Object.FindObjectsOfType<OreSpawnerMacine>();
+		foreach (OreSpawnerMacine oreSpawnerMacine in array2)
+		{
+			if (oreSpawnerMacine.enabled)
+			{
+				oreSpawnerMacine.Toggle(on: true);
 			}
 		}
 	}

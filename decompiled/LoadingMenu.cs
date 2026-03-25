@@ -55,6 +55,9 @@ public class LoadingMenu : MonoBehaviour
 	private TMP_Text _levelNameText;
 
 	[SerializeField]
+	private TMP_Text _gamemodeNameText;
+
+	[SerializeField]
 	private TMP_Text _moneyText;
 
 	[SerializeField]
@@ -157,6 +160,7 @@ public class LoadingMenu : MonoBehaviour
 		string text = (_lastSaveTimeText.text = TimeUtil.GetDisplaySaveTime(_SelectedSaveFileHeader.SaveTimestamp));
 		lastSaveTimeText.text = text;
 		_levelNameText.text = Singleton<LevelManager>.Instance.GetLevelByID(_SelectedSaveFileHeader.LevelID)?.DisplayName ?? ("<color=red>Missing: " + _SelectedSaveFileHeader.LevelID + "</color>");
+		_gamemodeNameText.text = Singleton<GamemodeManager>.Instance.GetColoredFormattedGamemodeName(_SelectedSaveFileHeader.GameMode);
 		_moneyText.text = $"${_SelectedSaveFileHeader.Money:#,##0.00}";
 		_playTimeText.text = SavingLoadingManager.GetFormattedPlaytime(_SelectedSaveFileHeader.TotalPlayTimeSeconds);
 		StartCoroutine(SetScreenshotForJson(_selectedSaveFileFullPath));
@@ -176,7 +180,7 @@ public class LoadingMenu : MonoBehaviour
 		}
 		else
 		{
-			if (_SelectedSaveFileHeader.SaveVersion < 15)
+			if (_SelectedSaveFileHeader.SaveVersion < 16)
 			{
 				_saveOutOfDateText.text = _saveFileOutOfDateString;
 			}

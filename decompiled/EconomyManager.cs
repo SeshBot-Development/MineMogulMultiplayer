@@ -80,13 +80,14 @@ public class EconomyManager : Singleton<EconomyManager>
 	public List<ShopCategory> GetAvailableShopCategories()
 	{
 		List<ShopCategory> list = new List<ShopCategory>();
-		if (Singleton<SettingsManager>.Instance.AlwaysShowHolidayShopItems)
+		bool flag = Singleton<DebugManager>.Instance.DevModeEnabled || Singleton<GamemodeManager>.Instance.ShouldShowSandboxShopTab();
+		bool alwaysShowHolidayShopItems = Singleton<SettingsManager>.Instance.AlwaysShowHolidayShopItems;
+		foreach (ShopCategory allShopCategory in _allShopCategories)
 		{
-			list.AddRange(_allShopCategories);
-		}
-		else
-		{
-			list.AddRange(_allShopCategories.Where((ShopCategory c) => !c.IsAnyHolidayCategory()));
+			if ((alwaysShowHolidayShopItems || !allShopCategory.IsAnyHolidayCategory()) && (flag || !allShopCategory.IsSandboxOnlyCategory))
+			{
+				list.Add(allShopCategory);
+			}
 		}
 		if (Singleton<DebugManager>.Instance.DevModeEnabled || Singleton<DebugManager>.Instance.ShowDevTestShopItems)
 		{

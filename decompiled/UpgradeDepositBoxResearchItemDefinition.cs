@@ -19,9 +19,36 @@ public class UpgradeDepositBoxResearchItemDefinition : ResearchItemDefinition
 	[SerializeField]
 	private SavableObjectID _savableObjectID;
 
+	public override bool IsLocked()
+	{
+		if (Singleton<GamemodeManager>.Instance.GameModeType == GameModeType.Sandbox)
+		{
+			return false;
+		}
+		return base.IsLocked();
+	}
+
+	public override bool CanAfford()
+	{
+		if (Singleton<GamemodeManager>.Instance.GameModeType == GameModeType.Sandbox)
+		{
+			return true;
+		}
+		return base.CanAfford();
+	}
+
 	public override void OnResearched()
 	{
-		Object.FindObjectOfType<DepositBox>().UpgradeToTier2();
+		DepositBox depositBox = Object.FindObjectOfType<DepositBox>();
+		if (depositBox != null)
+		{
+			depositBox.UpgradeToTier2();
+		}
+		if (Singleton<GamemodeManager>.Instance.GameModeType == GameModeType.Sandbox)
+		{
+			Singleton<ResearchManager>.Instance.AddResearchTickets(_researchTicketsCost);
+			Singleton<EconomyManager>.Instance.AddMoney(_moneyCost);
+		}
 	}
 
 	public override Sprite GetIcon()

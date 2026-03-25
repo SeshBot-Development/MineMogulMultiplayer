@@ -28,5 +28,6 @@ public enum KeybindAction
 	HotbarSlot8,
 	HotbarSlot9,
 	HotbarSlot10,
-	ToggleFlashlight
+	ToggleFlashlight,
+	Noclip
 }

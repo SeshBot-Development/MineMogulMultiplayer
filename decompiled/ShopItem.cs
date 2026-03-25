@@ -43,6 +43,10 @@ public class ShopItem
 
 	public bool IsNewlyUnlocked()
 	{
+		if (Singleton<GamemodeManager>.Instance.ShouldUseFreeShop())
+		{
+			return false;
+		}
 		if (!IsLocked && GetAmountPurchased() == 0)
 		{
 			return Definition.IsLockedByDefault;

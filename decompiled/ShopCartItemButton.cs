@@ -69,10 +69,17 @@ public class ShopCartItemButton : MonoBehaviour
 	public void ChangeQuantity(int quantity)
 	{
 		int max = _quantity;
-		if (Singleton<EconomyManager>.Instance != null && _shopUI != null && ShopItem != null)
+		if (!Singleton<GamemodeManager>.Instance.ShouldUseFreeShop())
 		{
-			max = Mathf.FloorToInt((Singleton<EconomyManager>.Instance.Money - (float)_shopUI.TotalCartPrice + (float)(ShopItem.GetPrice() * _quantity)) / (float)ShopItem.GetPrice());
-			max = Mathf.Max(0, max);
+			if (Singleton<EconomyManager>.Instance != null && _shopUI != null && ShopItem != null)
+			{
+				max = Mathf.FloorToInt((Singleton<EconomyManager>.Instance.Money - (float)_shopUI.TotalCartPrice + (float)(ShopItem.GetPrice() * _quantity)) / (float)ShopItem.GetPrice());
+				max = Mathf.Max(0, max);
+			}
+		}
+		else
+		{
+			max = quantity;
 		}
 		int a = Mathf.Clamp(quantity, -1, max);
 		a = ((!(ShopItem.Definition.BuildingInventoryDefinition != null)) ? Mathf.Min(a, 10) : Mathf.Min(a, ShopItem.Definition.BuildingInventoryDefinition.MaxInventoryStackSize));

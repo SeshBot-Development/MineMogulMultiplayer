@@ -129,6 +129,9 @@ namespace MineMogulMultiplayer.Models
         [Key(5)] public ShopPurchaseData[] ShopPurchases;
         [Key(6)] public ContractData ActiveContract;
         [Key(7)] public ContractData[] InactiveContracts;
+
+        /// <summary>Game mode type (0=Standard, 1=Sandbox). Synced so clients know sandbox rules.</summary>
+        [Key(8)] public int GameModeType;
     }
 
     // ──────────────────────────────────────────────

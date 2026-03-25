@@ -23,9 +23,7 @@ public class SellerMachine : MonoBehaviour
 		BaseSellableItem componentInParent3 = other.GetComponentInParent<BaseSellableItem>();
 		if (componentInParent3 != null)
 		{
-			Singleton<EconomyManager>.Instance.AddMoney(componentInParent3.GetSellValue());
-			Singleton<EconomyManager>.Instance.DispatchOnItemSoldEvent();
-			Object.Destroy(componentInParent3.gameObject);
+			componentInParent3.SellItem();
 		}
 	}
 

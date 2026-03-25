@@ -175,5 +175,69 @@ namespace MineMogulMultiplayer.Patches
             DirtyTracker.DirtyDetonatorIds.Add(__instance.DetonatorID);
             DirtyTracker.MoneyDirty = true;
         }
+
+        // ── OreSpawnerMacine ────────────────────────
+
+        [HarmonyPatch(typeof(OreSpawnerMacine), "Interact")]
+        [HarmonyPrefix]
+        public static bool Prefix_OreSpawnerMacine_Interact(OreSpawnerMacine __instance, Interaction selectedInteraction)
+        {
+            if (!MultiplayerState.IsOnline) return true;
+            if (NetworkBypass) return true;
+            if (MultiplayerState.IsHost)
+            {
+                var bo = __instance.GetComponentInParent<BuildingObject>();
+                if (bo != null)
+                    DirtyTracker.DirtyMachineInstanceIds.Add(bo.GetInstanceID());
+                return true;
+            }
+            // Client: send RPC for toggle actions
+            var session = SessionManager.Instance;
+            if (session != null)
+            {
+                string action = selectedInteraction?.Name;
+                if (action == "Turn On" || action == "Turn Off")
+                {
+                    session.SendInteractBuildingByPosRPC(
+                        new NetVector3(__instance.transform.position),
+                        "toggleOreSpawner",
+                        action == "Turn On" ? "on" : "off");
+                    return false;
+                }
+                // "Configure": let client open UI locally — config is sent via SetOrePrefab/SetSpawnRate patches
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OreSpawnerMacine), "SetOrePrefab")]
+        [HarmonyPostfix]
+        public static void Postfix_OreSpawnerMacine_SetOrePrefab(OreSpawnerMacine __instance)
+        {
+            if (!MultiplayerState.IsOnline) return;
+            if (NetworkBypass) return;
+            if (!MultiplayerState.IsHost)
+                SendOreSpawnerConfig(__instance);
+        }
+
+        [HarmonyPatch(typeof(OreSpawnerMacine), "SetSpawnRate")]
+        [HarmonyPostfix]
+        public static void Postfix_OreSpawnerMacine_SetSpawnRate(OreSpawnerMacine __instance)
+        {
+            if (!MultiplayerState.IsOnline) return;
+            if (NetworkBypass) return;
+            if (!MultiplayerState.IsHost)
+                SendOreSpawnerConfig(__instance);
+        }
+
+        private static void SendOreSpawnerConfig(OreSpawnerMacine machine)
+        {
+            var session = SessionManager.Instance;
+            if (session == null) return;
+            string saveData = machine.GetCustomSaveData();
+            session.SendInteractBuildingByPosRPC(
+                new NetVector3(machine.transform.position),
+                "configureOreSpawner",
+                saveData);
+        }
     }
 }

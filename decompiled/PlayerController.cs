@@ -230,7 +230,7 @@ public class PlayerController : MonoBehaviour
 		else
 		{
 			_input.Player.Enable();
-			if (Singleton<DebugManager>.Instance.DevModeEnabled && Input.GetKeyDown(KeyCode.V))
+			if (Singleton<GamemodeManager>.Instance.ShouldAllowNoclip() && _input.Player.Noclip.WasPressedThisFrame())
 			{
 				ToggleNoclip();
 			}

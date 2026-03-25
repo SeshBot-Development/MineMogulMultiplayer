@@ -20,7 +20,7 @@ public abstract class ResearchItemDefinition : ScriptableObject
 		Debug.Log("ResearchItemDefinition: OnResearched not implemented for " + base.name);
 	}
 
-	public bool IsLocked()
+	public virtual bool IsLocked()
 	{
 		if (PrerequisiteResearch.Count == 0)
 		{

@@ -36,6 +36,11 @@ public class ToolBuilder : BaseHeldTool
 		}
 	}
 
+	public override float GetSellValue()
+	{
+		return Singleton<EconomyManager>.Instance.GetPriceOfBuildingDefinition(Definition) * 0.9f * (float)Quantity;
+	}
+
 	private BuildingObject GetSelectedPrefab()
 	{
 		return Definition.BuildingPrefabs[CurrentPrefabIndex];
@@ -142,7 +147,7 @@ public class ToolBuilder : BaseHeldTool
 		{
 			AttachedNode.AttachBuilding(attachedBuildingObject);
 		}
-		if (!Singleton<DebugManager>.Instance.UnlimitedBuilding)
+		if (!Singleton<DebugManager>.Instance.ShoudlAllowUnlimitedBuilding())
 		{
 			Quantity--;
 			if (Quantity <= 0)

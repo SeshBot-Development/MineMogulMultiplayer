@@ -1,6 +1,8 @@
 using TMPro;
 using UnityEngine;
+using UnityEngine.UI;
 
+[DefaultExecutionOrder(-1)]
 public class ToolDebugSpawnTool : BaseHeldTool
 {
 	public float LaunchForce = 5f;
@@ -25,6 +27,9 @@ public class ToolDebugSpawnTool : BaseHeldTool
 
 	[SerializeField]
 	private TMP_Text _selectedObjectText;
+
+	[SerializeField]
+	private Image _selectedObjectImage;
 
 	private TimeSince _timeSinceLastSpawn;
 
@@ -75,6 +80,10 @@ public class ToolDebugSpawnTool : BaseHeldTool
 
 	public string GetSelectedObjectText()
 	{
+		if (Singleton<OreManager>.Instance == null)
+		{
+			return "Unknown";
+		}
 		return Singleton<OreManager>.Instance.GetColoredFormattedResourcePieceString(SelectedResourceType, SelectedPieceType, SelectedIsPolished);
 	}
 
@@ -107,14 +116,27 @@ public class ToolDebugSpawnTool : BaseHeldTool
 		}
 	}
 
+	public void SetOreFromPrefab(OrePiece orePrefab)
+	{
+		if (!(orePrefab == null))
+		{
+			SelectedResourceType = orePrefab.ResourceType;
+			SelectedPieceType = orePrefab.PieceType;
+			SelectedIsPolished = orePrefab.IsPolished;
+			Singleton<SoundManager>.Instance.PlayUISound(CloneSound);
+			UpdateScreenUI();
+		}
+	}
+
 	private void OpenMenu()
 	{
-		UpdateScreenUI();
+		Singleton<UIManager>.Instance.OreSpawnerSelectOreUI.StartSelectingOre(this);
 	}
 
 	public void UpdateScreenUI()
 	{
 		_selectedObjectText.text = GetSelectedObjectText();
+		_selectedObjectImage.sprite = Singleton<OreManager>.Instance.GetIconForOre(SelectedResourceType, SelectedPieceType, SelectedIsPolished);
 	}
 
 	public override void QButtonPressed()
@@ -139,5 +161,38 @@ public class ToolDebugSpawnTool : BaseHeldTool
 			_timeSinceLastSpawn = 0f;
 			LaunchObject();
 		}
+	}
+
+	public override void LoadFromSave(string json)
+	{
+		ToolDebugSpawnToolSaveData toolDebugSpawnToolSaveData = JsonUtility.FromJson<ToolDebugSpawnToolSaveData>(json);
+		if (toolDebugSpawnToolSaveData == null)
+		{
+			toolDebugSpawnToolSaveData = new ToolDebugSpawnToolSaveData();
+		}
+		if (toolDebugSpawnToolSaveData.IsInPlayerInventory)
+		{
+			StartCoroutine(WaitThenAddToInventory(toolDebugSpawnToolSaveData.InventorySlotIndex));
+		}
+		SelectedResourceType = toolDebugSpawnToolSaveData.OreResourceType;
+		SelectedPieceType = toolDebugSpawnToolSaveData.OrePieceType;
+		SelectedIsPolished = toolDebugSpawnToolSaveData.OreIsPolished;
+		UpdateScreenUI();
+	}
+
+	public override string GetCustomSaveData()
+	{
+		ToolDebugSpawnToolSaveData toolDebugSpawnToolSaveData = new ToolDebugSpawnToolSaveData
+		{
+			IsInPlayerInventory = (Owner != null)
+		};
+		if (toolDebugSpawnToolSaveData.IsInPlayerInventory)
+		{
+			toolDebugSpawnToolSaveData.InventorySlotIndex = Object.FindObjectOfType<PlayerInventory>().GetInventoryIndexForTool(this);
+		}
+		toolDebugSpawnToolSaveData.OrePieceType = SelectedPieceType;
+		toolDebugSpawnToolSaveData.OreResourceType = SelectedResourceType;
+		toolDebugSpawnToolSaveData.OreIsPolished = SelectedIsPolished;
+		return JsonUtility.ToJson(toolDebugSpawnToolSaveData);
 	}
 }

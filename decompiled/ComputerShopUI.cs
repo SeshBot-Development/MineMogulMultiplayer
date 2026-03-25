@@ -147,7 +147,7 @@ public class ComputerShopUI : MonoBehaviour
 			shopCategoryButton.Initialize(availableShopCategory);
 			shopCategoryButton.OnPressed += OpenShopCategory;
 			_categoryButtons.Add(shopCategoryButton);
-			if (availableShopCategory.DontShowIfAllItemsAreLocked && availableShopCategory.ShopItems.All((ShopItem item) => item.IsLocked))
+			if (availableShopCategory.DontShowIfAllItemsAreLocked && (!Singleton<GamemodeManager>.Instance.ShouldUseFreeShop() || availableShopCategory.IsTrophyCategory) && availableShopCategory.ShopItems.All((ShopItem item) => item.IsLocked))
 			{
 				shopCategoryButton.gameObject.SetActive(value: false);
 				_hiddenCategoryButtons.Add(shopCategoryButton);
@@ -199,6 +199,10 @@ public class ComputerShopUI : MonoBehaviour
 	public bool CanAffordCart()
 	{
 		TotalCartPrice = _cartItems.Sum((ShopCartItemButton ci) => ci.ShopItem.GetPrice() * ci.GetQuantity());
+		if (Singleton<GamemodeManager>.Instance.ShouldUseFreeShop())
+		{
+			return _cartItems.Count > 0;
+		}
 		if (Singleton<EconomyManager>.Instance.Money >= (float)TotalCartPrice)
 		{
 			return _cartItems.Count > 0;
@@ -230,15 +234,19 @@ public class ComputerShopUI : MonoBehaviour
 			{
 				Debug.LogWarning("Some items in the cart could not be purchased due to spawn failures.");
 			}
+			foreach (ShopCategoryButton categoryButton in _categoryButtons)
 			{
-				foreach (ShopCategoryButton categoryButton in _categoryButtons)
-				{
-					categoryButton.RefreshUI();
-				}
-				return;
+				categoryButton.RefreshUI();
+			}
+			if (Singleton<GamemodeManager>.Instance.ShouldUseFreeShop() && Singleton<EconomyManager>.Instance.Money < 0f)
+			{
+				Singleton<EconomyManager>.Instance.SetMoney(0f);
 			}
 		}
-		Debug.Log("Not enough money to complete the purchase.");
+		else
+		{
+			Debug.Log("Not enough money to complete the purchase.");
+		}
 	}
 
 	private bool TrySpawnItem(ShopItemDefinition item, int quantity)
@@ -272,7 +280,14 @@ public class ComputerShopUI : MonoBehaviour
 
 	private void RefreshCurrency()
 	{
-		_moneyCounter.text = $"${Singleton<EconomyManager>.Instance.Money:#,##0.00}";
+		if (Singleton<GamemodeManager>.Instance.ShouldUseFreeShop())
+		{
+			_moneyCounter.text = "$Infinite";
+		}
+		else
+		{
+			_moneyCounter.text = $"${Singleton<EconomyManager>.Instance.Money:#,##0.00}";
+		}
 		if (CanAffordCart())
 		{
 			_purchaseCartButton.interactable = true;

@@ -18,4 +18,6 @@ public class LevelInfo
 	public bool ShouldAppearInMapSelect;
 
 	public bool IsLockedInDemo = true;
+
+	public bool ShouldForceSandboxGamemode;
 }

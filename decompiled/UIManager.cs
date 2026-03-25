@@ -30,6 +30,8 @@ public class UIManager : Singleton<UIManager>
 
 	public EditTextPopup EditTextPopup;
 
+	public OreSpawnerSelectOreUI OreSpawnerSelectOreUI;
+
 	public bool HudIsHidden;
 
 	[SerializeField]
@@ -49,6 +51,7 @@ public class UIManager : Singleton<UIManager>
 		UpdateOnScreenControls();
 		_versionNumberText.text = Singleton<VersionManager>.Instance.GetVersionTextWithoutLabel();
 		EditTextPopup.gameObject.SetActive(value: false);
+		OreSpawnerSelectOreUI.gameObject.SetActive(value: false);
 		_input = Singleton<KeybindManager>.Instance.Input;
 	}
 
@@ -91,6 +94,10 @@ public class UIManager : Singleton<UIManager>
 		{
 			return true;
 		}
+		if (OreSpawnerSelectOreUI.isActiveAndEnabled)
+		{
+			return true;
+		}
 		return false;
 	}
 
@@ -122,6 +129,11 @@ public class UIManager : Singleton<UIManager>
 	public bool IsInEditTextPopup()
 	{
 		return EditTextPopup.gameObject.activeSelf;
+	}
+
+	public bool IsInOreSpawnerSelectOreUI()
+	{
+		return OreSpawnerSelectOreUI.gameObject.activeSelf;
 	}
 
 	private void LateUpdate()
@@ -169,6 +181,10 @@ public class UIManager : Singleton<UIManager>
 				}
 			}
 		}
+		if (IsInOreSpawnerSelectOreUI() && _input.Player.MirrorObject.WasPressedThisFrame() && Cursor.lockState == CursorLockMode.None)
+		{
+			OreSpawnerSelectOreUI.gameObject.SetActive(value: false);
+		}
 		if (Input.GetKeyDown(KeyCode.Escape) || _input.Player.Inventory.WasPressedThisFrame())
 		{
 			ComputerShopUI.gameObject.SetActive(value: false);
@@ -176,6 +192,7 @@ public class UIManager : Singleton<UIManager>
 			InteractionWheelUI.CloseWheel();
 			QuestTreeUI.gameObject.SetActive(value: false);
 			EditTextPopup.gameObject.SetActive(value: false);
+			OreSpawnerSelectOreUI.gameObject.SetActive(value: false);
 		}
 		if (IsInAnyMenu())
 		{
@@ -214,6 +231,16 @@ public class UIManager : Singleton<UIManager>
 			HudObject.SetActive(!HudIsHidden);
 			PauseMenu.gameObject.SetActive(value: false);
 		}
+	}
+
+	public void ShowOreSpawnerSelectOreUI(ToolDebugSpawnTool spawnerTool)
+	{
+		OreSpawnerSelectOreUI.StartSelectingOre(spawnerTool);
+	}
+
+	public void ShowOreSpawnerSelectOreUI(OreSpawnerMacine oreSpawnerMachine)
+	{
+		OreSpawnerSelectOreUI.StartSelectingOreAndSpawnRate(oreSpawnerMachine);
 	}
 
 	public void StartEditingText(EditableSign editableSign)

@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 [DefaultExecutionOrder(-900)]
 public class SavingLoadingManager : Singleton<SavingLoadingManager>
 {
-	public const int CurrentSaveFileVersion = 15;
+	public const int CurrentSaveFileVersion = 16;
 
 	public bool ValidateMissingSavableObjectIDs;
 
@@ -178,7 +178,7 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 	{
 		return version switch
 		{
-			15 => true, 
+			16 => true, 
 			4 => true, 
 			5 => true, 
 			6 => true, 
@@ -190,6 +190,7 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 			12 => true, 
 			13 => true, 
 			14 => true, 
+			15 => true, 
 			_ => false, 
 		};
 	}
@@ -580,7 +581,7 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 		_totalPlayTimeSeconds = GetTotalPlayTimeSeconds();
 		ResetSessionStartTime();
 		SaveFileHeader saveFileHeader = new SaveFileHeader();
-		saveFileHeader.SaveVersion = 15;
+		saveFileHeader.SaveVersion = 16;
 		saveFileHeader.GameVersion = Singleton<VersionManager>.Instance.VersionNumber;
 		saveFileHeader.SaveTimestamp = DateTime.Now.ToString("o");
 		saveFileHeader.LevelID = Singleton<LevelManager>.Instance.GetCurrentLevelID();
@@ -588,6 +589,7 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 		saveFileHeader.ResearchTickets = Singleton<ResearchManager>.Instance.ResearchTickets;
 		saveFileHeader.TotalPlayTimeSeconds = _totalPlayTimeSeconds;
 		saveFileHeader.IsDemoVersion = Singleton<DemoManager>.Instance.IsDemoVersion;
+		saveFileHeader.GameMode = Singleton<GamemodeManager>.Instance.GameModeType;
 		SaveFile saveFile = new SaveFile();
 		saveFile.SaveVersion = saveFileHeader.SaveVersion;
 		saveFile.GameVersion = saveFileHeader.GameVersion;
@@ -597,8 +599,10 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 		saveFile.ResearchTickets = saveFileHeader.ResearchTickets;
 		saveFile.TotalPlayTimeSeconds = saveFileHeader.TotalPlayTimeSeconds;
 		saveFile.IsDemoVersion = saveFileHeader.IsDemoVersion;
+		saveFile.GameMode = saveFileHeader.GameMode;
 		HashSet<ISaveLoadableObject> hashSet = Enumerable.ToHashSet(UnityEngine.Object.FindObjectsOfType<MonoBehaviour>().OfType<ISaveLoadableObject>());
-		hashSet.AddRange(UnityEngine.Object.FindObjectOfType<PlayerInventory>().Items.Where((BaseHeldTool baseHeldTool) => baseHeldTool != null));
+		PlayerInventory playerInventory = UnityEngine.Object.FindObjectOfType<PlayerInventory>();
+		hashSet.AddRange(playerInventory.Items.Where((BaseHeldTool baseHeldTool) => baseHeldTool != null));
 		foreach (ISaveLoadableObject item3 in hashSet)
 		{
 			if (!item3.ShouldBeSaved())
@@ -674,6 +678,7 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 		saveFile.PlayerPosition = playerController.transform.position;
 		saveFile.PlayerRotation = playerController.transform.rotation.eulerAngles;
 		saveFile.HasShownOreLimitPopup = Singleton<OreLimitManager>.Instance.HasShownOreLimitPopup;
+		saveFile.LastActiveInventorySlot = playerInventory.GetActiveToolSlotIndex();
 		string json = JsonUtility.ToJson(saveFile, prettyPrint: true);
 		WriteSaveAtomically(fullSaveFilePath, json);
 		LastSaveTime = Time.time;
@@ -839,8 +844,9 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 		Singleton<ResearchManager>.Instance.SetResearchTickets(saveFile.ResearchTickets);
 		Singleton<ResearchManager>.Instance.LoadFromSaveFile(saveFile.CompletedResearchItems);
 		Singleton<OreLimitManager>.Instance.HasShownOreLimitPopup = saveFile.HasShownOreLimitPopup;
+		Singleton<GamemodeManager>.Instance.GameModeType = saveFile.GameMode;
 		Singleton<QuestManager>.Instance.LoadFromSaveFile(saveFile);
-		if (saveFile.SaveVersion < 15)
+		if (saveFile.SaveVersion < 16)
 		{
 			Singleton<ResearchManager>.Instance.MigrateNewResearchPrices();
 		}
@@ -855,10 +861,9 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 		LastSaveTime = Time.time;
 		ActiveSaveFileName = Path.GetFileNameWithoutExtension(fullFilePath);
 		IsCurrentlyLoadingGame = false;
-		AutoMiner[] array2;
 		if (saveFile.SaveVersion < 15 && saveFile.LevelID == "BigCave")
 		{
-			array2 = UnityEngine.Object.FindObjectsOfType<AutoMiner>();
+			AutoMiner[] array2 = UnityEngine.Object.FindObjectsOfType<AutoMiner>();
 			foreach (AutoMiner autoMiner in array2)
 			{
 				if (autoMiner.enabled)
@@ -868,22 +873,32 @@ public class SavingLoadingManager : Singleton<SavingLoadingManager>
 			}
 			Singleton<UIManager>.Instance.ShowInfoMessagePopup("New Update!", "The Big Cave has recieved an update! \nThere are now more explodable walls around the cave.\n \nAll Auto-Miners have been automatically turned off.\nIt's recommended to follow your conveyors explode any walls that may have been placed in their paths.");
 		}
-		if (saveFile.SaveVersion >= 15 || !(saveFile.LevelID == "NewCave"))
+		if (saveFile.SaveVersion < 15 && saveFile.LevelID == "NewCave")
 		{
-			return;
-		}
-		array2 = UnityEngine.Object.FindObjectsOfType<AutoMiner>();
-		foreach (AutoMiner autoMiner2 in array2)
-		{
-			if (autoMiner2.enabled)
+			AutoMiner[] array2 = UnityEngine.Object.FindObjectsOfType<AutoMiner>();
+			foreach (AutoMiner autoMiner2 in array2)
 			{
-				autoMiner2.Toggle(on: false);
+				if (autoMiner2.enabled)
+				{
+					autoMiner2.Toggle(on: false);
+				}
 			}
+			if (Singleton<UpdatedLevelNewObjectAdder>.Instance.AgeOfSteelObjectPrefab != null)
+			{
+				UnityEngine.Object.Instantiate(Singleton<UpdatedLevelNewObjectAdder>.Instance.AgeOfSteelObjectPrefab);
+			}
+			Singleton<UIManager>.Instance.ShowInfoMessagePopup("Age of Steel", "Welcome to the Age of Steel Update! \nThis is MineMogul's biggest update yet, featuring many new machines and quests.\n \nThe 'Classic Cave' has been updated. Many areas (including the starting area) have been expanded to provide more space to build. Some Auto-Miner spots have been moved around and upgraded to Heavy Auto-Miner spots. Please take a look around your factory.\n \nFull patch notes are available on Steam. Hope you enjoy!");
 		}
-		if (Singleton<UpdatedLevelNewObjectAdder>.Instance.AgeOfSteelObjectPrefab != null)
+		StartCoroutine(WaitThenFinishLoading(saveFile));
+	}
+
+	public IEnumerator WaitThenFinishLoading(SaveFile saveFile)
+	{
+		yield return null;
+		yield return null;
+		if (base.gameObject.activeInHierarchy)
 		{
-			UnityEngine.Object.Instantiate(Singleton<UpdatedLevelNewObjectAdder>.Instance.AgeOfSteelObjectPrefab);
+			UnityEngine.Object.FindObjectOfType<PlayerInventory>().SwitchTool(saveFile.LastActiveInventorySlot);
 		}
-		Singleton<UIManager>.Instance.ShowInfoMessagePopup("Age of Steel", "Welcome to the Age of Steel Update! \nThis is MineMogul's biggest update yet, featuring many new machines and quests.\n \nThe 'Classic Cave' has been updated. Many areas (including the starting area) have been expanded to provide more space to build. Some Auto-Miner spots have been moved around and upgraded to Heavy Auto-Miner spots. Please take a look around your factory.\n \nFull patch notes are available on Steam. Hope you enjoy!");
 	}
 }

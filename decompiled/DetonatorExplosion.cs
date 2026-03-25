@@ -48,6 +48,10 @@ public class DetonatorExplosion : MonoBehaviour, ISaveLoadableWorldEvent
 
 	public void Initialize(DetonatorExplosionState detonatorExplosionState)
 	{
+		if (Singleton<GamemodeManager>.Instance.ShouldUseFreeShop())
+		{
+			CostToBuy = 0f;
+		}
 		_detonatorExplosionState = detonatorExplosionState;
 		if (HasExploded())
 		{

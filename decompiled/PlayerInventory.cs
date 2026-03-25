@@ -232,11 +232,20 @@ public class PlayerInventory : MonoBehaviour
 		}
 	}
 
-	private void SwitchTool(int index)
+	public int GetActiveToolSlotIndex()
+	{
+		return Items.IndexOf(ActiveTool);
+	}
+
+	public void SwitchTool(int index)
 	{
 		if (ActiveTool != null)
 		{
 			ActiveTool.gameObject.SetActive(value: false);
+		}
+		if (index < 0 || index > Items.Count - 1)
+		{
+			index = 0;
 		}
 		if (ActiveTool == Items[index])
 		{

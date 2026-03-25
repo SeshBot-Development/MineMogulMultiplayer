@@ -4,6 +4,7 @@ using Unity.VisualScripting;
 using UnityEngine;
 using UnityEngine.Serialization;
 
+[DefaultExecutionOrder(-10)]
 public class OreManager : Singleton<OreManager>
 {
 	[FormerlySerializedAs("ResourceDescriptions")]
@@ -67,6 +68,16 @@ public class OreManager : Singleton<OreManager>
 			return "<color=#" + text2 + ">Polished " + text4 + " " + text3 + "</color>";
 		}
 		return "<color=#" + text2 + ">" + text4 + " " + text3 + "</color>";
+	}
+
+	public Sprite GetIconForOre(ResourceType resourceType, PieceType pieceType, bool isPolished = false)
+	{
+		OrePiece orePiece = Singleton<SavingLoadingManager>.Instance.AllOrePiecePrefabs.Find((OrePiece ore) => ore.ResourceType == resourceType && ore.PieceType == pieceType && ore.IsPolished == isPolished);
+		if (orePiece != null)
+		{
+			return orePiece.GetIcon();
+		}
+		return null;
 	}
 
 	public float GetDefaultSellValue(ResourceType resourceType, PieceType pieceType, bool isPolished)

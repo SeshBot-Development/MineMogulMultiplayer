@@ -10,7 +10,7 @@ public class LoopingSoundPlayer : MonoBehaviour
 
 	public bool ShouldPlay = true;
 
-	private static string _triggerLayerName = "LocalPlayerOnlyTrigger";
+	private static string _triggerLayerName = "LocalPlayerAudioTrigger";
 
 	private bool _isInRange;
 

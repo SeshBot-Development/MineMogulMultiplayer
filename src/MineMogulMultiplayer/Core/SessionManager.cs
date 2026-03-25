@@ -1065,9 +1065,11 @@ namespace MineMogulMultiplayer.Core
                 _net.SendToAll(MessageType.OreRemovedBatch, _poolRemovedOreIds);
 
             // Periodically send position updates for ores that have moved significantly
-            // Send every tick for smoother movement (was every 2 ticks)
-            SendOrePositionUpdates();
-            SendCratePositionUpdates();
+            if (_tick % OrePositionSyncInterval == 0)
+            {
+                SendOrePositionUpdates();
+                SendCratePositionUpdates();
+            }
 
             // Release ores that haven't been remotely updated recently
             ReleaseStaleRemoteOres();
@@ -1472,20 +1474,18 @@ namespace MineMogulMultiplayer.Core
             // Send position update every other tick (~10 times/sec at 20 tps)
             _tick++;
 
-            // Send ore/crate position updates every tick for smoother held-item sync
             if (_net != null && _net.IsRunning)
             {
                 if (TryGetLocalPlayerPose(out var pos, out var rot, out var pc))
                 {
                     if (pc != null)
-                    {
-                        SendClientOrePositions(pc);
                         DetectAndSendItemDrop(pc);
-                    }
 
-                    // Send player input at half rate (every 2 ticks)
-                    if (_tick % 2 == 0)
+                    // Send player input + ore positions every 2 ticks (~10 times/sec at 20 tps)
+                    if (_tick % OrePositionSyncInterval == 0)
                     {
+                        if (pc != null)
+                            SendClientOrePositions(pc);
                         string heldId = null;
                         var heldPos = default(NetVector3);
                         var heldRot = default(NetQuaternion);
@@ -3094,6 +3094,28 @@ namespace MineMogulMultiplayer.Core
                     }
                     break;
 
+                case "toggleOreSpawner":
+                    var spawner = target.GetComponentInChildren<OreSpawnerMacine>();
+                    if (spawner != null)
+                    {
+                        BuildingInteractionPatch.NetworkBypass = true;
+                        try { spawner.Toggle(msg.Data == "on"); }
+                        finally { BuildingInteractionPatch.NetworkBypass = false; }
+                        DirtyTracker.DirtyMachineInstanceIds.Add(target.GetInstanceID());
+                    }
+                    break;
+
+                case "configureOreSpawner":
+                    var spawnerCfg = target.GetComponentInChildren<OreSpawnerMacine>();
+                    if (spawnerCfg != null && msg.Data != null)
+                    {
+                        BuildingInteractionPatch.NetworkBypass = true;
+                        try { spawnerCfg.LoadFromSave(msg.Data); }
+                        finally { BuildingInteractionPatch.NetworkBypass = false; }
+                        DirtyTracker.DirtyMachineInstanceIds.Add(target.GetInstanceID());
+                    }
+                    break;
+
                 default:
                     // Fallback: mark machine dirty for CustomSaveData propagation
                     if (target is ICustomSaveDataProvider)
@@ -3197,6 +3219,11 @@ namespace MineMogulMultiplayer.Core
                 var contracts = Singleton<ContractsManager>.Instance;
                 if (contracts != null)
                     ApplyContractState(contracts, snapshot.World);
+
+                // Sync game mode type (Standard/Sandbox)
+                var gmm = Singleton<GamemodeManager>.Instance;
+                if (gmm != null)
+                    gmm.GameModeType = (GameModeType)snapshot.World.GameModeType;
             }
 
             // Update remote player visuals
@@ -4267,6 +4294,7 @@ namespace MineMogulMultiplayer.Core
             {
                 Money = eco != null ? eco.Money : 0,
                 ResearchTickets = research != null ? research.ResearchTickets : 0,
+                GameModeType = (int)(Singleton<GamemodeManager>.Instance?.GameModeType ?? 0),
                 CompletedResearchIds = research?.CompletedResearchItems?
                     .Select(id => id.ToString()).ToArray() ?? Array.Empty<string>(),
                 CompletedQuestIds = quests?.GetCompletedQuestIDs()?

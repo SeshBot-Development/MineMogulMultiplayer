@@ -46,6 +46,12 @@ public class InventoryUIManager : Singleton<InventoryUIManager>
 	[SerializeField]
 	private TMP_Text _equipToolButtonText;
 
+	[SerializeField]
+	private TMP_Text _deleteOrSellButtonText;
+
+	[SerializeField]
+	private GameObject _deleteOrSellButton;
+
 	private float _displayedMoney;
 
 	private float _updateTimer;
@@ -88,6 +94,9 @@ public class InventoryUIManager : Singleton<InventoryUIManager>
 	{
 		if (show)
 		{
+			bool flag = Singleton<GamemodeManager>.Instance.ShouldUseFreeShop();
+			_deleteOrSellButtonText.text = (flag ? "Delete" : "Sell");
+			_deleteOrSellButton.SetActive(flag);
 			UpdateSelectedItemInfo(null);
 			Singleton<QuestManager>.Instance.ActivateQuestTrigger(TriggeredQuestRequirementType.OpenInventory);
 			this.InventoryOpened?.Invoke();
@@ -147,6 +156,24 @@ public class InventoryUIManager : Singleton<InventoryUIManager>
 		}
 	}
 
+	public void DeleteOrSellSelectedTool()
+	{
+		if (!(SelectedTool == null))
+		{
+			if (Singleton<GamemodeManager>.Instance.ShouldUseFreeShop())
+			{
+				UnityEngine.Object.Destroy(SelectedTool.gameObject);
+				UpdateSelectedItemInfo(null);
+			}
+			else
+			{
+				Debug.Log(SelectedTool.GetSellValue());
+				SelectedTool.SellItem();
+				UpdateSelectedItemInfo(null);
+			}
+		}
+	}
+
 	private void Update()
 	{
 		_updateTimer += Time.deltaTime;
@@ -162,14 +189,14 @@ public class InventoryUIManager : Singleton<InventoryUIManager>
 
 	public void UpdateAvailableQuestCount(Quest quest = null)
 	{
-		int count = Singleton<QuestManager>.Instance.GetAvailableQuests().Count;
-		if (count == 0)
+		int num = ((!Singleton<GamemodeManager>.Instance.ShouldDisableQuests()) ? Singleton<QuestManager>.Instance.GetAvailableQuests().Count : 0);
+		if (num == 0)
 		{
 			_availableQuestsObject.SetActive(value: false);
 			return;
 		}
 		_availableQuestsObject.SetActive(value: true);
-		_availableQuestsText.text = string.Format("{0} Quest{1} Available!", count, (count > 1) ? "s" : "");
+		_availableQuestsText.text = string.Format("{0} Quest{1} Available!", num, (num > 1) ? "s" : "");
 	}
 
 	public void UpdateResearchTicketCount(int amount = 0)

@@ -149,6 +149,11 @@ public class BreakableCrate : BaseSellableItem, IDamageable, ISaveLoadableObject
 		}
 	}
 
+	public override void SellItem()
+	{
+		BreakCrate(base.transform.position);
+	}
+
 	public void PlayImpactSound(float volume = 1f, float pitch = 1f)
 	{
 		Singleton<SoundManager>.Instance.PlaySoundAtLocation(PhysicsImpactSound, base.transform.position, volume, pitch);

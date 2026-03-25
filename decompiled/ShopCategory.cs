@@ -15,6 +15,10 @@ public class ShopCategory
 
 	public bool DontShowIfAllItemsAreLocked;
 
+	public bool IsSandboxOnlyCategory;
+
+	public bool IsTrophyCategory;
+
 	public HolidayType HolidayType;
 
 	public bool IsAnyHolidayCategory()
@@ -24,6 +28,10 @@ public class ShopCategory
 
 	public bool ContainsNewItems()
 	{
+		if (Singleton<GamemodeManager>.Instance.ShouldUseFreeShop())
+		{
+			return false;
+		}
 		return ShopItems.Any((ShopItem item) => item.IsNewlyUnlocked());
 	}
 }
