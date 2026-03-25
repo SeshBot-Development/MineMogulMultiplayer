@@ -7,6 +7,6 @@ namespace MineMogulMultiplayer.Core
     {
         public const string GUID = "com.minemogul.multiplayer";
         public const string Name = "MineMogul Multiplayer";
-        public const string Version = "1.4.20";
+        public const string Version = "1.4.21";
     }
 }

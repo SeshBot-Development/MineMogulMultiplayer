@@ -133,7 +133,7 @@ namespace MineMogulMultiplayer.Core
         private readonly Dictionary<int, float> _remotelyHeldOres = new Dictionary<int, float>(); // netId → lastUpdateTime
         private readonly Dictionary<int, Vector3> _lastRemoteOreVelocity = new Dictionary<int, Vector3>(); // netId → last known velocity
         private readonly Dictionary<int, float> _remotelyHeldCrates = new Dictionary<int, float>(); // netId → lastUpdateTime
-        private const float RemoteHoldTimeout = 1.0f; // seconds before ore returns to physics
+        private const float RemoteHoldTimeout = 0.5f; // seconds before ore returns to physics
         private readonly List<int> _poolStaleReleaseIds = new List<int>(); // pooled list for ReleaseStaleRemoteOres
         // ── Cached magnet reflection (avoid per-tick reflection cost) ──
         private System.Reflection.FieldInfo _cachedMagnetHeldBodiesField;
@@ -1258,6 +1258,9 @@ namespace MineMogulMultiplayer.Core
                 if (ore == null) continue;
                 int netId = kv.Key;
 
+                // Skip ores that a client is remotely holding — the client is the authority
+                if (_remotelyHeldOres.ContainsKey(netId)) continue;
+
                 var pos = ore.transform.position;
                 if (_lastSentOrePositions.TryGetValue(netId, out var lastPos))
                 {
@@ -1385,8 +1388,8 @@ namespace MineMogulMultiplayer.Core
                         rb.isKinematic = false;
                         if (_lastRemoteOreVelocity.TryGetValue(netId, out var vel))
                         {
-                            // Dampen release velocity to reduce bouncing in piles
-                            rb.linearVelocity = vel * 0.5f;
+                            // Dampen release velocity slightly to reduce bouncing in piles
+                            rb.linearVelocity = vel * 0.8f;
                         }
                     }
                     _lastRemoteOreVelocity.Remove(netId);
@@ -1443,11 +1446,13 @@ namespace MineMogulMultiplayer.Core
         private readonly List<OrePositionUpdate> _clientOreUpdatePool = new List<OrePositionUpdate>();
         /// <summary>Net IDs of ores the client is currently holding/moving locally. Skip host position updates for these.</summary>
         private readonly HashSet<int> _clientLocallyHeldOres = new HashSet<int>();
+        private readonly HashSet<int> _clientLocallyHeldOresNext = new HashSet<int>();
         // ── Client crate position tracking ──
         private readonly Dictionary<int, Vector3> _clientLastSentCratePos = new Dictionary<int, Vector3>();
         private readonly List<CratePositionUpdate> _clientCrateUpdatePool = new List<CratePositionUpdate>();
         /// <summary>Net IDs of crates the client is currently holding/moving locally. Skip host position updates for these.</summary>
         private readonly HashSet<int> _clientLocallyHeldCrates = new HashSet<int>();
+        private readonly HashSet<int> _clientLocallyHeldCratesNext = new HashSet<int>();
 
         /// <summary>
         /// Smoothly interpolate ore and crate positions toward their network targets.
@@ -1585,9 +1590,11 @@ namespace MineMogulMultiplayer.Core
         private void SendClientOrePositions(PlayerController pc)
         {
             _clientOreUpdatePool.Clear();
-            _clientLocallyHeldOres.Clear();
             _clientCrateUpdatePool.Clear();
-            _clientLocallyHeldCrates.Clear();
+
+            // Build the new set of locally-held ores this tick, then swap
+            _clientLocallyHeldOresNext.Clear();
+            _clientLocallyHeldCratesNext.Clear();
 
             // Check for hand-grabbed object
             try
@@ -1711,6 +1718,10 @@ namespace MineMogulMultiplayer.Core
             if (_clientOreUpdatePool.Count > 0)
                 _net.SendToHost(MessageType.OrePositionBatch, _clientOreUpdatePool);
 
+            // Swap in the new locally-held set (atomic replacement prevents stale frames)
+            _clientLocallyHeldOres.Clear();
+            foreach (var id in _clientLocallyHeldOresNext) _clientLocallyHeldOres.Add(id);
+
             // Check for magnet-held or hand-held crates too
             foreach (var kv in _clientCrateByNetId)
             {
@@ -1752,6 +1763,10 @@ namespace MineMogulMultiplayer.Core
             // Send crate position updates
             if (_clientCrateUpdatePool.Count > 0)
                 _net.SendToHost(MessageType.CratePositionBatch, _clientCrateUpdatePool);
+
+            // Swap in the new locally-held crate set
+            _clientLocallyHeldCrates.Clear();
+            foreach (var id in _clientLocallyHeldCratesNext) _clientLocallyHeldCrates.Add(id);
         }
 
         private void TryAddClientOreUpdate(OrePiece ore)
@@ -1760,7 +1775,7 @@ namespace MineMogulMultiplayer.Core
             if (!_clientOreToNetId.TryGetValue(ore, out int netId)) return;
 
             // Mark this ore as locally held so host position updates are skipped
-            _clientLocallyHeldOres.Add(netId);
+            _clientLocallyHeldOresNext.Add(netId);
 
             // Make sure the ore is non-kinematic so the client can move it
             var oreRb = ore.GetComponent<Rigidbody>();
@@ -1794,7 +1809,7 @@ namespace MineMogulMultiplayer.Core
             if (netId < 0) return;
 
             // Mark this crate as locally held so host position updates are skipped
-            _clientLocallyHeldCrates.Add(netId);
+            _clientLocallyHeldCratesNext.Add(netId);
 
             // Make sure the crate is non-kinematic so the client can move it
             var rb = crate.GetComponent<Rigidbody>();
@@ -5520,6 +5535,8 @@ namespace MineMogulMultiplayer.Core
                                 rb.angularVelocity = msg.AngularVelocity.ToUnity();
                             }
                             _remotelyHeldOres.Remove(msg.NetworkId);
+                            _lastSentOrePositions.Remove(msg.NetworkId);
+                            _lastRemoteOreVelocity.Remove(msg.NetworkId);
                             break;
                         }
                     }
