@@ -19,7 +19,7 @@ namespace MineMogulMultiplayer.Updater
     {
         private const string Owner = "SeshBot-Development";
         private const string Repo = "MineMogulMultiplayer";
-        private const string AssetName = "MineMogulMultiplayer-mod.zip";
+        private const string AssetName = "MineMogulMultiplayer-v";
         private const string SteamAppId = "3846120";
         private const string StagingFolderName = "_mmmp_update_staging";
 
@@ -238,8 +238,8 @@ del ""%~f0""
             foreach (Match block in Regex.Matches(json, @"\{(?:[^{}]|\{[^{}]*\})*\}", RegexOptions.Singleline))
             {
                 var a = block.Value;
-                // Check if this block has a matching "name" or "label" field
-                if (!Regex.IsMatch(a, $@"""(?:name|label)""\s*:\s*""{escaped}""")) continue;
+                // Check if this block has a matching "name" or "label" field (prefix match for versioned assets)
+                if (!Regex.IsMatch(a, $@"""(?:name|label)""\s*:\s*""{escaped}[^""]*\.zip""")) continue;
                 var urlM = Regex.Match(a, @"""browser_download_url""\s*:\s*""([^""]+)""");
                 if (urlM.Success) return urlM.Groups[1].Value;
             }
@@ -251,6 +251,8 @@ del ""%~f0""
 
         // ── Zip extraction ──────────────────────────────────────────────
 
+        private const string ZipModPrefix = "BepInEx/plugins/MineMogulMultiplayer/";
+
         private static void ExtractOverwrite(string zipPath, string destDir)
         {
             using (var archive = ZipFile.OpenRead(zipPath))
@@ -258,7 +260,16 @@ del ""%~f0""
                 foreach (var entry in archive.Entries)
                 {
                     if (string.IsNullOrEmpty(entry.Name)) continue;
-                    var destFile = Path.Combine(destDir, entry.FullName);
+
+                    // Only extract mod plugin files, strip the ZIP path prefix
+                    var normalized = entry.FullName.Replace('\\', '/');
+                    if (!normalized.StartsWith(ZipModPrefix, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var relativePath = normalized.Substring(ZipModPrefix.Length);
+                    if (string.IsNullOrEmpty(relativePath)) continue;
+
+                    var destFile = Path.Combine(destDir, relativePath);
                     var dir = Path.GetDirectoryName(destFile);
                     if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                         Directory.CreateDirectory(dir);
