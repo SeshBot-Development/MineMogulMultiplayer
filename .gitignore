@@ -34,3 +34,5 @@ zip_staging/
 open-dnspy.bat
 publish-release.ps1
 update_token.txt
+
+decompiled_new/

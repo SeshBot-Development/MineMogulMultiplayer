@@ -34,6 +34,7 @@ namespace MineMogulMultiplayer.Patches
         private static string _pendingSceneName;
         private static string _pendingSaveName;
         private static bool _pendingIsNewGame;
+        private static GameModeType _pendingGameMode;
 
         // Coroutine driver (we need a MonoBehaviour to run coroutines)
         private static LobbyPoller _poller;
@@ -77,6 +78,7 @@ namespace MineMogulMultiplayer.Patches
             _pendingSceneName = sceneName;
             _pendingIsNewGame = false;
             _pendingSaveName = null;
+            _pendingGameMode = header.GameMode;
 
             BeginLobbyFlow();
             return false; // skip original
@@ -384,7 +386,7 @@ namespace MineMogulMultiplayer.Patches
             if (_pendingIsNewGame)
                 session.LaunchNewGame(_pendingSaveName, _pendingSceneName, playerName);
             else
-                session.LaunchGame(_pendingSaveFilePath, _pendingSceneName, playerName);
+                session.LaunchGame(_pendingSaveFilePath, _pendingSceneName, playerName, _pendingGameMode);
 
             ShowOverlayStatus("<color=#88CC88>Launching...</color>");
             HideOverlay();

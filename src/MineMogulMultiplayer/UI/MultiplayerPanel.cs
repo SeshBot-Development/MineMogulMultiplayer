@@ -649,7 +649,7 @@ namespace MineMogulMultiplayer.UI
         /// <summary>Called by Plugin when F8 is pressed to refresh the button state.</summary>
         public void RefreshDebugBotButton() => UpdateDebugBotButton();
 
-        private void OnSaveSelected(string fullFilePath, string levelId)
+        private void OnSaveSelected(string fullFilePath, string levelId, GameModeType gameMode)
         {
             if (_session == null || !_session.SteamReady || _session.Phase != SessionManager.LobbyPhase.InLobby) return;
 
@@ -691,7 +691,7 @@ namespace MineMogulMultiplayer.UI
                 return;
             }
 
-            _session.LaunchGame(fullFilePath, sceneName, _cfgPlayerName.Value);
+            _session.LaunchGame(fullFilePath, sceneName, _cfgPlayerName.Value, gameMode);
             _lobbyStatus.text = $"<color=#{ColorUtility.ToHtmlStringRGB(UIFactory.StatusGreen)}>Launching game...</color>";
             Hide();
         }
@@ -968,7 +968,8 @@ namespace MineMogulMultiplayer.UI
 
             string filePath = combo.FullFilePath;
             string levelId = header.LevelID;
-            launchBtn.onClick.AddListener(() => OnSaveSelected(filePath, levelId));
+            GameModeType gameMode = header.GameMode;
+            launchBtn.onClick.AddListener(() => OnSaveSelected(filePath, levelId, gameMode));
 
             return row.gameObject;
         }

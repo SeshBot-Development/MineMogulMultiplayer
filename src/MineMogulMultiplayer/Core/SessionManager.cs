@@ -727,7 +727,7 @@ namespace MineMogulMultiplayer.Core
         }
 
         /// <summary>Host launches the game: starts P2P, sets lobby data, loads save.</summary>
-        public void LaunchGame(string fullFilePath, string sceneName, string playerName)
+        public void LaunchGame(string fullFilePath, string sceneName, string playerName, GameModeType gameMode = GameModeType.Standard)
         {
             if (!SteamReady || !_lobby.HasValue) { _log.LogError("[Session] Cannot launch — no lobby"); return; }
 
@@ -750,8 +750,8 @@ namespace MineMogulMultiplayer.Core
             var slm = Singleton<SavingLoadingManager>.Instance;
             if (slm != null)
             {
-                slm.LoadSceneThenLoadSave(fullFilePath, sceneName);
-                _log.LogInfo($"[Session] Host launching: loading '{fullFilePath}' scene '{sceneName}'");
+                slm.LoadSceneThenLoadSave(fullFilePath, sceneName, gameMode);
+                _log.LogInfo($"[Session] Host launching: loading '{fullFilePath}' scene '{sceneName}' mode '{gameMode}'");
             }
             else
             {
